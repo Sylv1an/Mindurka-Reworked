@@ -3515,7 +3515,7 @@ class MainMenu:
             text_col = COLOR_GRAY if not btn['enabled'] else COLOR_WHITE
             pygame.draw.rect(self.screen, color, btn['rect']); pygame.draw.rect(self.screen, COLOR_BLACK, btn['rect'], 2)
             draw_text(self.screen, btn['text'], 30, btn['rect'].centerx, btn['rect'].centery, text_col, align="center")
-        draw_text(self.screen, "v15.0", 16, cx - 10, ch - 20, COLOR_GRAY, align="bottomright")
+        draw_text(self.screen, "Version: a15", 16, cx - 10, ch - 20, COLOR_GRAY, align="bottomright")
 
 # --- Main Application Loop ---
 def main():
