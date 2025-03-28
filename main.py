@@ -3218,7 +3218,7 @@ if __name__ == '__main__':
         traceback.print_exc()
         print("---------------------------------")
         try:
-            pygame.quit() # Attempt to cleanup pygame if possible
+            pygame.quit() # Attempt to clean up pygame if possible
         except Exception:
             pass
         sys.exit("Exited due to critical error.")
