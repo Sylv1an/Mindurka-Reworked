@@ -49,6 +49,8 @@ MUSIC_END_EVENT = pygame.USEREVENT + 1
 MUSIC_FADE_MS = 500
 DEFAULT_MUSIC_VOLUME = 0.6 # Volume from 0.0 to 1.0
 
+#UI
+CONFIG_FILENAME = "config.json"
 UI_HEIGHT = 140
 FPS = 60
 GAME_TITLE = "Mindurka Reworked"
@@ -2666,10 +2668,76 @@ def main():
     pygame.init()
     pygame.font.init()
 
+    # --- Load Configuration ---
+    # Define default config first
+    app_config = {
+        'name': "Player",
+        'color_index': 0,
+        'host_ip': "127.0.0.1",
+        'resolution_index': DEFAULT_RESOLUTION_INDEX,
+        'network_interval': DEFAULT_NETWORK_UPDATE_INTERVAL,
+        # Add volume later if needed, start with default from constant
+    }
+    # Keep track of loaded volume separately initially
+    loaded_volume = DEFAULT_MUSIC_VOLUME
+
+    print(f"Attempting to load configuration from {CONFIG_FILENAME}...")
+    try:
+        with open(CONFIG_FILENAME, 'r') as f:
+            loaded_config = json.load(f)
+
+            # Validate and update app_config with loaded values
+            app_config['name'] = str(loaded_config.get('name', app_config['name'])).strip()[:16]
+            app_config['color_index'] = int(loaded_config.get('color_index', app_config['color_index']))
+            app_config['host_ip'] = str(loaded_config.get('host_ip', app_config['host_ip'])).strip()
+            app_config['resolution_index'] = int(loaded_config.get('resolution_index', app_config['resolution_index']))
+            app_config['network_interval'] = float(loaded_config.get('network_interval', app_config['network_interval']))
+            # Load volume, clamping it between 0.0 and 1.0
+            loaded_volume = max(0.0, min(1.0, float(loaded_config.get('volume', DEFAULT_MUSIC_VOLUME))))
+
+
+            print("Configuration loaded successfully.")
+
+    except FileNotFoundError:
+        print(f"Configuration file '{CONFIG_FILENAME}' not found. Using defaults.")
+    except (json.JSONDecodeError, TypeError, ValueError) as e:
+        print(f"Error loading or parsing configuration file: {e}. Using defaults.")
+        # Keep the default app_config and loaded_volume defined above
+
+    # --- Validate loaded/default values ---
+    # Validate Resolution Index
+    if not (0 <= app_config['resolution_index'] < len(AVAILABLE_RESOLUTIONS)):
+        print(f"WARN: Invalid resolution index ({app_config['resolution_index']}) found. Resetting to default.")
+        app_config['resolution_index'] = DEFAULT_RESOLUTION_INDEX
+
+    # Validate and Clamp Network Interval
+    try:
+        net_interval = float(app_config['network_interval'])
+        app_config['network_interval'] = max(MIN_NETWORK_UPDATE_INTERVAL,
+                                             min(net_interval, MAX_NETWORK_UPDATE_INTERVAL))
+    except (ValueError, TypeError):
+        print(f"WARN: Invalid network interval ({app_config['network_interval']}) found. Resetting to default.")
+        app_config['network_interval'] = DEFAULT_NETWORK_UPDATE_INTERVAL
+
+    # Validate Color Index
+    if not (0 <= app_config['color_index'] < len(COLOR_PLAYER_OPTIONS)):
+         print(f"WARN: Invalid color index ({app_config['color_index']}). Clamping.")
+         app_config['color_index'] = max(0, min(app_config['color_index'], len(COLOR_PLAYER_OPTIONS) - 1))
+
+    # Validate Volume (already clamped during load attempt)
+    app_config['volume'] = loaded_volume # Add validated volume to app_config
+
+    print(f"Final Initial Config: Name='{app_config['name']}', ResIndex={app_config['resolution_index']}, NetInterval={app_config['network_interval']:.4f}, Volume={app_config['volume']:.2f}")
+    # --- END Load Configuration ---
+
+
+    # --- Mixer Initialization ---
+    menu_music_loaded = False
     try:
         pygame.mixer.init()
         print("Audio Mixer Initialized.")
-        pygame.mixer.music.set_volume(DEFAULT_MUSIC_VOLUME)
+        # Set initial volume based on loaded/default config
+        pygame.mixer.music.set_volume(app_config['volume'])
         # Pre-load menu music
         try:
             if os.path.exists(MAIN_MENU_MUSIC_FILE):
@@ -2678,87 +2746,84 @@ def main():
                 menu_music_loaded = True
             else:
                 print(f"WARN: Main menu music file not found: {MAIN_MENU_MUSIC_FILE}")
-                menu_music_loaded = False
         except pygame.error as e:
             print(f"ERROR: Could not load main menu music: {e}")
-            menu_music_loaded = False
     except pygame.error as e:
         print(f"ERROR: Failed to initialize audio mixer: {e}")
-        menu_music_loaded = False  # Ensure flag is false if mixer fails
+    # ----------------------------------
 
-    app_config = {
-        'name': "Player", 'color_index': 0, 'host_ip': "127.0.0.1",
-        'resolution_index': DEFAULT_RESOLUTION_INDEX, 'network_interval': DEFAULT_NETWORK_UPDATE_INTERVAL,
-    }
-    # TODO: Load app_config from file
-
+    # --- Screen Initialization (Uses validated app_config) ---
     try:
-        res_index = int(app_config['resolution_index'])
-        if not (0 <= res_index < len(AVAILABLE_RESOLUTIONS)): raise IndexError
-        initial_width, initial_height = AVAILABLE_RESOLUTIONS[res_index]
-    except (IndexError, ValueError, TypeError):
-        print(f"WARN: Invalid resolution index {app_config['resolution_index']}, using default.")
+        initial_width, initial_height = AVAILABLE_RESOLUTIONS[app_config['resolution_index']]
+    except IndexError:
+        print(f"FATAL: Corrected resolution index still invalid? Using default.")
         app_config['resolution_index'] = DEFAULT_RESOLUTION_INDEX
         initial_width, initial_height = AVAILABLE_RESOLUTIONS[DEFAULT_RESOLUTION_INDEX]
-
-    try:
-        net_interval = float(app_config['network_interval'])
-        app_config['network_interval'] = max(MIN_NETWORK_UPDATE_INTERVAL,
-                                             min(net_interval, MAX_NETWORK_UPDATE_INTERVAL))
-    except (ValueError, TypeError):
-        print(f"WARN: Invalid network interval {app_config['network_interval']}, using default.")
-        app_config['network_interval'] = DEFAULT_NETWORK_UPDATE_INTERVAL
 
     screen = pygame.display.set_mode((initial_width, initial_height))
     pygame.display.set_caption(GAME_TITLE)
     clock = pygame.time.Clock()
+    # --- End Screen Init ---
 
     init_fonts()
     if not font_medium: print("FATAL: Font load failed."); pygame.quit(); sys.exit()
 
     current_state = STATE_MAIN_MENU
-
+    # --- Play menu music initially ---
     if menu_music_loaded:
         try:
-            pygame.mixer.music.play(-1, fade_ms=MUSIC_FADE_MS)  # Loop indefinitely
+            pygame.mixer.music.play(-1, fade_ms=MUSIC_FADE_MS) # Loop indefinitely
         except pygame.error as e:
             print(f"ERROR: Failed to play initial menu music: {e}")
+    # ---------------------------------------
 
+    # --- Initialize Menus (Use loaded/validated app_config) ---
     main_menu = MainMenu(screen, clock)
     settings_menu = SettingsMenu(screen, clock,
-                                 app_config['name'], app_config['color_index'],
-                                 app_config['resolution_index'], app_config['network_interval'])
-    settings_menu.current_ip = app_config['host_ip']
+                                 app_config['name'],
+                                 app_config['color_index'],
+                                 app_config['resolution_index'],
+                                 app_config['network_interval']) # Pass initial values
+    settings_menu.current_ip = app_config['host_ip'] # Set initial IP in settings menu
+    # --- End Menu Init ---
 
     game_instance = None;
     server_instance = None;
     client_instance = None
     app_running = True;
     previous_state = -1
-    current_network_interval = app_config['network_interval']
+    current_network_interval = app_config['network_interval'] # Use validated interval
     last_network_update_time = 0.0;
     local_ip_address = get_local_ip()
 
+    # --- Main Loop ---
     while app_running:
-        dt = min(clock.tick(FPS) / 1000.0, 0.1)
+        dt = min(clock.tick(FPS) / 1000.0, 0.1) # Delta time in seconds
         events_this_frame = pygame.event.get()
-        action = None
+        action = None # Action determined by menu or game state changes
+
+        # --- Global Event Processing (Quit, Music End) ---
         for event in events_this_frame:
-            if event.type == pygame.QUIT: app_running = False; break
+            if event.type == pygame.QUIT:
+                app_running = False; break
             if event.type == MUSIC_END_EVENT:
+                # Handle song ending if in a game state
                 if game_instance and current_state in [STATE_PLAYING_SP, STATE_HOSTING, STATE_PLAYING_MP_CLIENT]:
                     game_instance.handle_music_end_event()
-        if not app_running: break
+        if not app_running: break # Exit loop immediately if QUIT detected
+        # --- End Global Events ---
 
+
+        # --- State Change Music Logic ---
         if current_state != previous_state:
             print(f"State changed from {previous_state} to {current_state}")
             is_game_state = current_state in [STATE_PLAYING_SP, STATE_HOSTING, STATE_PLAYING_MP_CLIENT]
+            was_menu_state = previous_state == STATE_MAIN_MENU
             was_game_state = previous_state in [STATE_PLAYING_SP, STATE_HOSTING, STATE_PLAYING_MP_CLIENT]
 
-            # Stop music if leaving menu OR leaving game
-            if previous_state == STATE_MAIN_MENU or was_game_state:
+            # Fade out music if leaving menu OR leaving game state
+            if was_menu_state or was_game_state:
                 try:
-                    # Fade out unless instantly switching between game states maybe?
                     pygame.mixer.music.fadeout(MUSIC_FADE_MS)
                     print("Music fading out...")
                 except pygame.error as e:
@@ -2767,33 +2832,52 @@ def main():
             # Start menu music if entering menu (and it's loaded)
             if current_state == STATE_MAIN_MENU and menu_music_loaded:
                 try:
-                    # Ensure it's loaded again in case game music was playing
+                    # Stop ensures no leftover game music interferes before load/play
+                    pygame.mixer.music.stop()
                     pygame.mixer.music.load(MAIN_MENU_MUSIC_FILE)
+                    # Use current volume from app_config
+                    pygame.mixer.music.set_volume(app_config['volume'])
                     pygame.mixer.music.play(-1, fade_ms=MUSIC_FADE_MS)
-                    print("Menu music playing.")
+                    print(f"Menu music playing at volume {app_config['volume']:.2f}.")
                 except pygame.error as e:
                     print(f"ERROR: Failed to play menu music on state change: {e}")
 
-            # If entering a game state, music will be controlled by the game instance (buttons/auto-play)
-            # We just ensure non-menu music is stopped here.
+            # If entering a game state, music might start via game instance controls
+            # Ensure volume is set correctly when entering game
+            if is_game_state:
+                 try:
+                      # Set volume, even if music isn't playing yet
+                      pygame.mixer.music.set_volume(app_config['volume'])
+                      print(f"Game state entered, mixer volume set to {app_config['volume']:.2f}.")
+                      # Optionally, auto-start first game song if desired
+                      # if game_instance and not pygame.mixer.music.get_busy():
+                      #     game_instance.load_and_play_song(0)
+                 except pygame.error as e:
+                      print(f"WARN: Error setting volume on game state entry: {e}")
 
-            previous_state = current_state  # Update tracker
 
-        # Update Network Instances
+            previous_state = current_state # Update tracker
+        # --- END State Change Music Logic ---
+
+
+        # --- Update Network Instances ---
         if server_instance and server_instance.running: server_instance.update()
         if client_instance and client_instance.running:
             client_instance.update()
+            # Check for disconnection AFTER updating client
             if not client_instance.connected and current_state == STATE_PLAYING_MP_CLIENT:
                 print("CLIENT: Disconnected. Returning to menu.")
                 current_state = STATE_MAIN_MENU;
                 game_instance = None;
                 client_instance = None
-                # Add a small delay or message screen before switching? Optional.
+                # Add a small delay or message screen? Optional.
+                continue # Skip rest of the frame processing
+        # --- End Network Update ---
+
 
         # --- State-Specific Logic ---
-        # (STATE_MAIN_MENU, STATE_SETTINGS, STATE_SHOW_IP, STATE_HOSTING, STATE_PLAYING_SP remain the same as previous version)
         if current_state == STATE_MAIN_MENU:
-            main_menu.screen = screen
+            main_menu.screen = screen # Ensure menu uses current screen surface
             for event in events_this_frame: main_menu.handle_event(event)
             action = main_menu.get_action()
             if action == "quit":
@@ -2801,39 +2885,48 @@ def main():
             elif action == "play_sp":
                 current_state = STATE_PLAYING_SP
                 game_instance = Game(screen, clock, app_config, network_mode="sp")
+                # Update game instance volume based on current config
+                if game_instance: game_instance.current_volume = app_config['volume']
             elif action == "host_mp":
                 server_instance = Server('', DEFAULT_PORT);
                 game_instance = Game(screen, clock, app_config, network_mode="host", server=server_instance)
+                if game_instance: game_instance.current_volume = app_config['volume'] # Set initial volume
                 server_instance.set_game_instance(game_instance);
                 server_instance.start()
                 if server_instance.running:
-                    host_player = game_instance.players.get(0)
+                    host_player = game_instance.players.get(0) # Host is player 0
                     if host_player:
                         with server_instance.game_lock:
                             server_instance.initial_snapshot = game_instance.get_full_snapshot()
                         print(f"SERVER: Hosting started. Player 0 ('{host_player.name}') added. Snapshot created.")
                     else:
-                        print("ERROR: Host player not found!")
+                        print("ERROR: Host player (ID 0) not found after game instance creation!")
                     current_state = STATE_SHOW_IP
                 else:
-                    print("Error: Failed server start."); server_instance = None; game_instance = None
+                    print("Error: Failed to start server."); server_instance = None; game_instance = None
             elif action == "join_mp":
                 current_state = STATE_JOINING;
                 target_ip = app_config.get('host_ip', '127.0.0.1')
                 client_instance = Client(target_ip, DEFAULT_PORT, app_config)
                 if client_instance.connect():
+                    # Create game instance AFTER successful connection
                     game_instance = Game(screen, clock, app_config, network_mode="client", client=client_instance)
+                    if game_instance: game_instance.current_volume = app_config['volume'] # Set initial volume
                     current_state = STATE_PLAYING_MP_CLIENT
+                    print("CLIENT: Connected successfully, entering game state.")
                 else:
-                    print(
-                        f"Error: Failed connect to {target_ip}."); client_instance = None; current_state = STATE_MAIN_MENU
+                    print(f"Error: Failed connect to {target_ip}. Returning to menu.");
+                    client_instance = None; # Ensure client is None if connect failed
+                    current_state = STATE_MAIN_MENU
             elif action == "settings":
+                # Update settings menu with CURRENT app_config before showing
                 settings_menu.screen = screen;
                 settings_menu.current_name = app_config['name']
                 settings_menu.selected_color_index = app_config['color_index']
                 settings_menu.current_resolution_index = app_config['resolution_index']
                 settings_menu.current_network_interval_str = f"{current_network_interval:.4f}"
                 settings_menu.current_ip = app_config['host_ip']
+                # Do NOT set volume here, SettingsMenu doesn't handle it directly
                 settings_menu.input_active = settings_menu.ip_input_active = settings_menu.interval_input_active = False
                 settings_menu._setup_ui();
                 current_state = STATE_SETTINGS
@@ -2844,90 +2937,122 @@ def main():
             for event in events_this_frame:
                 settings_action = settings_menu.handle_event(event)
                 if settings_action == 'back': break
-            settings_menu.update(dt)
+            settings_menu.update(dt) # Update cursor blink etc.
+
             if settings_action == 'back':
                 new_settings = settings_menu.get_settings();
                 resolution_changed = (new_settings['resolution_index'] != app_config['resolution_index'])
-                app_config.update(new_settings);
-                current_network_interval = app_config['network_interval']
-                print(
-                    f"Settings Updated: ResIndex={app_config['resolution_index']}, NetInterval={current_network_interval:.4f}")
+
+                # Update app_config (volume is NOT in new_settings)
+                app_config['name'] = new_settings['name']
+                app_config['color_index'] = new_settings['color_index']
+                app_config['host_ip'] = new_settings['host_ip']
+                app_config['resolution_index'] = new_settings['resolution_index']
+                app_config['network_interval'] = new_settings['network_interval']
+
+                current_network_interval = app_config['network_interval'] # Update interval used by host state
+                print(f"Settings Updated & Stored in app_config: ResIndex={app_config['resolution_index']}, NetInterval={current_network_interval:.4f}")
+
+                # Apply Resolution Change
                 if resolution_changed:
                     try:
                         new_w, new_h = AVAILABLE_RESOLUTIONS[app_config['resolution_index']]
                         print(f"Applying resolution: {new_w}x{new_h}")
                         screen = pygame.display.set_mode((new_w, new_h))
+                        # Update screen references for menus
                         main_menu.screen = screen;
-                        settings_menu.screen = screen  # Update refs
+                        settings_menu.screen = screen
+                        # If game_instance exists (unlikely here, but safety), update its screen ref too
+                        if game_instance: game_instance.screen = screen
                     except Exception as e:
                         print(f"ERROR applying resolution: {e}")
-                        app_config['resolution_index'] = DEFAULT_RESOLUTION_INDEX  # Revert config
+                        app_config['resolution_index'] = DEFAULT_RESOLUTION_INDEX # Revert config
                         def_w, def_h = AVAILABLE_RESOLUTIONS[DEFAULT_RESOLUTION_INDEX]
-                        screen = pygame.display.set_mode((def_w, def_h))  # Apply default screen
+                        screen = pygame.display.set_mode((def_w, def_h)) # Apply default screen
+                        # Update screen references
                         main_menu.screen = screen;
-                        settings_menu.screen = screen  # Update refs
-                current_state = STATE_MAIN_MENU
+                        settings_menu.screen = screen
+                        if game_instance: game_instance.screen = screen
+
+                current_state = STATE_MAIN_MENU # Go back to menu
 
         elif current_state == STATE_SHOW_IP:
-            # (Drawing logic remains the same)
+            # Display IP info - this state now auto-transitions
             current_w, current_h = screen.get_width(), screen.get_height()
             screen.fill(COLOR_DARK_GRAY)
-            draw_text(screen, f"Hosting on IP: {local_ip_address}", 36, current_w // 2, current_h // 2 - 40,
-                      COLOR_WHITE, align="center")
+            draw_text(screen, f"Hosting on IP: {local_ip_address}", 36, current_w // 2, current_h // 2 - 40, COLOR_WHITE, align="center")
             draw_text(screen, f"Port: {DEFAULT_PORT}", 36, current_w // 2, current_h // 2, COLOR_WHITE, align="center")
-            draw_text(screen, f"Update Interval: {current_network_interval:.3f}s", 24, current_w // 2,
-                      current_h // 2 + 40, COLOR_GRAY, align="center")
-            draw_text(screen, "Press any key or wait 5 seconds...", 24, current_w // 2, current_h - 50, COLOR_GRAY,
-                      align="center")
+            draw_text(screen, f"Update Interval: {current_network_interval:.3f}s", 24, current_w // 2, current_h // 2 + 40, COLOR_GRAY, align="center")
+            draw_text(screen, "Waiting for players... Press ESC to cancel", 24, current_w // 2, current_h - 50, COLOR_GRAY, align="center")
             pygame.display.flip()
-            ip_display_timer = 5.0;
-            start_time = time.time();
-            proceed = False
-            while time.time() - start_time < ip_display_timer:
-                for event in pygame.event.get():
-                    if event.type == pygame.QUIT: app_running = False; proceed = True; break
-                    if event.type == pygame.KEYDOWN or event.type == pygame.MOUSEBUTTONDOWN: proceed = True; break
-                if proceed: break
-                clock.tick(30)
-            if app_running: current_state = STATE_HOSTING
+
+            # Check only for ESC key to cancel hosting
+            esc_pressed = False
+            for event in events_this_frame:
+                 if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                      esc_pressed = True; break
+            if esc_pressed:
+                 print("Hosting cancelled by user.")
+                 current_state = STATE_MAIN_MENU
+                 if server_instance: server_instance.stop(); server_instance = None
+                 game_instance = None
+            else:
+                 # Stay in this state visually, game logic runs in HOSTING state
+                 current_state = STATE_HOSTING
 
 
         elif current_state == STATE_HOSTING:
-            # (Logic remains the same, ensure broadcast uses current_network_interval)
             if not game_instance or not server_instance or not server_instance.running:
-                print("ERROR: Hosting state invalid.");
+                print("ERROR: Hosting state invalid. Returning to menu.");
                 current_state = STATE_MAIN_MENU
                 if server_instance: server_instance.stop(); server_instance = None
                 game_instance = None;
-                continue
+                continue # Skip rest of frame
+
+            # Handle HOST player input + process network inputs
             queued_inputs = server_instance.get_queued_inputs()
             with server_instance.game_lock:
+                # Process inputs received from clients
                 for net_input in queued_inputs:
                     pid, payload = net_input['player_id'], net_input['payload']
                     act_type, act_data = payload.get('action'), payload.get('data')
                     player = game_instance.players.get(pid)
-                    if player:  # Process player actions
+                    if player:
                         if act_type == 'move':
                             player.move_x, player.move_y = act_data.get('x', 0), act_data.get('y', 0)
                         elif act_type == 'place':
-                            game_instance.action_place_structure(pid, act_data['type'], act_data['gx'], act_data['gy'],
-                                                                 act_data['orient'])
+                            game_instance.action_place_structure(pid, act_data['type'], act_data['gx'], act_data['gy'], act_data['orient'])
                         elif act_type == 'remove':
                             game_instance.action_remove_structure(pid, act_data['gx'], act_data['gy'])
                         elif act_type == 'upgrade':
                             game_instance.action_upgrade_structure(pid, act_data['gx'], act_data['gy'])
-            game_instance.handle_events(events_this_frame)
-            if not game_instance.running: action = 'back_to_menu'
-            game_instance.dt = dt
-            with server_instance.game_lock:
+
+                # Handle input for the host player (Player 0)
+                # Pass app_config to handle_events if needed, but Game uses its own state mostly
+                game_instance.handle_events(events_this_frame)
+                if not game_instance.running: # Check if ESC was pressed in game
+                    action = 'back_to_menu'
+
+                # Update Game State (Server authoritative)
+                game_instance.dt = dt
                 game_instance.update()
+
+                # Update game volume based on host's setting (might be controlled by game UI now)
+                app_config['volume'] = game_instance.current_volume # Sync back from game slider
+                try:
+                     pygame.mixer.music.set_volume(app_config['volume'])
+                except pygame.error: pass
+
+            # Network Broadcast State
             current_time = time.time()
-            if current_time - last_network_update_time >= current_network_interval:  # Use current interval
+            if current_time - last_network_update_time >= current_network_interval:
                 last_network_update_time = current_time;
                 snapshot = None
                 with server_instance.game_lock:
                     snapshot = game_instance.get_full_snapshot()
                 if snapshot: server_instance.broadcast_message({'type': 'state_update', 'data': snapshot})
+
+            # Check if host wants to leave
             if action == 'back_to_menu':
                 current_state = STATE_MAIN_MENU;
                 server_instance.stop();
@@ -2935,124 +3060,165 @@ def main():
                 game_instance = None
 
 
-        # --- MODIFIED STATE_PLAYING_MP_CLIENT ---
         elif current_state == STATE_PLAYING_MP_CLIENT:
-            if not game_instance or not client_instance or not client_instance.connected:
-                # This condition is already handled by the check after network updates
-                # If we reach here, we are assumed to be connected for this frame
-                pass  # Or add redundant check: current_state = STATE_MAIN_MENU; etc.
+            if not game_instance or not client_instance: # Connection loss handled earlier
+                print("ERROR: Client state invalid. Returning to menu.")
+                current_state = STATE_MAIN_MENU
+                if client_instance: client_instance.disconnect(); client_instance = None
+                game_instance = None
+                continue
 
-            game_instance.screen = screen  # Update screen ref in case of resize
+            game_instance.screen = screen # Update screen ref
 
-            # 1. Process Received Server Messages with Error Handling
+            # Process Received Server Messages
             received = client_instance.get_received_messages()
-            try:  # <<<<<<<<<<<<<<<<<<<< ADD TRY BLOCK
+            error_processing = False
+            try:
                 for msg in received:
                     msg_type = msg.get('type')
-                    msg_data = msg.get('data')  # Get data part
-
-                    if not msg_type: continue  # Skip if no type
+                    msg_data = msg.get('data')
+                    if not msg_type: continue
 
                     if msg_type == 'initial_state':
                         print("CLIENT: Applying initial state.")
                         if msg_data: game_instance.apply_full_snapshot(msg_data)
                     elif msg_type == 'state_update':
-                        # Applying full state frequently
                         if msg_data: game_instance.apply_full_snapshot(msg_data)
                     else:
-                        # Handle specific incremental updates (pass the whole msg)
                         game_instance.apply_incremental_update(msg)
 
-            except Exception as e:  # <<<<<<<<<<<<<<<<<<<< ADD EXCEPT BLOCK
+            except Exception as e:
                 print("\n--- CLIENT ERROR PROCESSING SERVER MESSAGE ---")
-                print(f"Error Type: {type(e).__name__}")
-                print(f"Error Details: {e}")
-                print(f"Problematic Message Type: {msg.get('type', 'N/A')}")
-                # Optionally print part of the data, but be careful with large snapshots
-                # print(f"Problematic Data Snippet: {str(msg.get('data', 'N/A'))[:200]}...")
-                import traceback
-                traceback.print_exc()
+                print(f"Error Type: {type(e).__name__}, Details: {e}")
+                # import traceback; traceback.print_exc() # Uncomment for detailed stack trace
                 print("---------------------------------------------")
-                # Decide what to do: disconnect, show error message, etc.
                 print("CLIENT: Error processing state, disconnecting.")
-                action = 'back_to_menu'  # Signal to disconnect and return to menu
+                action = 'back_to_menu' # Signal to disconnect
+                error_processing = True
 
-            # 2. Handle Local Input (Send to Server) - Only if no error occurred
-            if action != 'back_to_menu':
+            # Handle Local Input (Send to Server) - Only if no error
+            if not error_processing:
                 game_instance.handle_events(events_this_frame)
-                if not game_instance.running:  # Check if ESC was pressed
+                if not game_instance.running: # Check if ESC was pressed
                     action = 'back_to_menu'
 
-            # 3. Update Local Animations / Visuals - Only if no error occurred
-            if action != 'back_to_menu':
-                game_instance.dt = dt
-                game_instance.update()  # Client update
+                # Update game volume based on client's setting
+                app_config['volume'] = game_instance.current_volume # Sync back from game slider
+                try:
+                     pygame.mixer.music.set_volume(app_config['volume'])
+                except pygame.error: pass
 
-            # 4. Check if client wants to leave or error occurred
+
+            # Update Local Visuals/Animations - Only if no error
+            if not error_processing:
+                game_instance.dt = dt
+                game_instance.update() # Client update (animations, local player prediction if any)
+
+            # Check if client wants to leave or error occurred
             if action == 'back_to_menu':
                 current_state = STATE_MAIN_MENU
-                if client_instance: client_instance.disconnect(); client_instance = None  # Ensure disconnect
+                if client_instance: client_instance.disconnect(); client_instance = None
                 game_instance = None
-                # Add a small pause or message screen? Optional.
 
 
         elif current_state == STATE_PLAYING_SP:
-            # (Remains the same)
-            if not game_instance: print("ERROR: SP state invalid."); current_state = STATE_MAIN_MENU; continue
-            game_instance.screen = screen
+            if not game_instance:
+                print("ERROR: SP state invalid. Returning to menu."); current_state = STATE_MAIN_MENU; continue
+
+            game_instance.screen = screen # Update screen ref
+
+            # Handle Input
             game_instance.handle_events(events_this_frame)
-            if not game_instance.running: action = 'back_to_menu'
+            if not game_instance.running: # Check if ESC pressed
+                action = 'back_to_menu'
+
+            # Update Game State
             game_instance.dt = dt;
             game_instance.update()
-            if action == 'back_to_menu': current_state = STATE_MAIN_MENU; game_instance = None
+
+            # Update game volume based on player's setting
+            app_config['volume'] = game_instance.current_volume # Sync back from game slider
+            try:
+                 pygame.mixer.music.set_volume(app_config['volume'])
+            except pygame.error: pass
+
+
+            # Check if player wants to leave
+            if action == 'back_to_menu':
+                current_state = STATE_MAIN_MENU; game_instance = None
+
+        # --- End State-Specific Logic ---
+
 
         # --- Draw based on State ---
-        # (Remains the same)
-        screen.fill(COLOR_DARK_GRAY)
+        screen.fill(COLOR_DARK_GRAY) # Default background
         if current_state == STATE_MAIN_MENU:
-            main_menu.draw()
+            if main_menu: main_menu.draw()
         elif current_state == STATE_SETTINGS:
-            settings_menu.draw()
+            if settings_menu: settings_menu.draw()
         elif current_state == STATE_SHOW_IP:
-            pass
+             # Drawing handled within the state logic for this frame
+             pass
         elif current_state in [STATE_HOSTING, STATE_PLAYING_MP_CLIENT, STATE_PLAYING_SP]:
             if game_instance:
                 game_instance.draw()
-            else:
-                draw_text(screen, "Error: No game instance", 30, screen.get_width() // 2, screen.get_height() // 2,
-                          COLOR_RED, "center")
+            else: # Should not happen if state transitions are correct
+                draw_text(screen, "Error: Game not loaded", 30, screen.get_width() // 2, screen.get_height() // 2, COLOR_RED, "center")
         elif current_state == STATE_JOINING:
-            draw_text(screen, f"Connecting to {app_config['host_ip']}...", 30, screen.get_width() // 2,
-                      screen.get_height() // 2, COLOR_WHITE, "center")
-        pygame.display.flip()
+            draw_text(screen, f"Connecting to {app_config.get('host_ip', '?')}...", 30, screen.get_width() // 2, screen.get_height() // 2, COLOR_WHITE, "center")
+        # --- End Drawing ---
+
+        pygame.display.flip() # Update the full display Surface to the screen
+    # --- End Main Loop ---
+
 
     # --- Cleanup ---
-    # (Remains the same)
     print("Exiting Application.")
+    # --- Save Configuration ---
+    print(f"Attempting to save configuration to {CONFIG_FILENAME}...")
+    try:
+        # Ensure app_config has the latest volume before saving
+        if game_instance: # If exiting from a game state, get latest volume
+            app_config['volume'] = game_instance.current_volume
+        elif 'volume' not in app_config: # If somehow volume key is missing, add default
+             app_config['volume'] = DEFAULT_MUSIC_VOLUME
+
+        with open(CONFIG_FILENAME, 'w') as f:
+            json.dump(app_config, f, indent=4)
+        print("Configuration saved successfully.")
+    except IOError as e:
+        print(f"ERROR: Could not save configuration file: {e}")
+    # --- END Save Configuration ---
+
+    # --- Stop Music ---
     try:
         pygame.mixer.music.stop()
-    except pygame.error:
-        pass
-    # TODO: Save app_config
+        pygame.mixer.quit() # Properly shut down mixer
+    except pygame.error: pass
+    # -----------------------
+
     if server_instance: server_instance.stop()
     if client_instance: client_instance.disconnect()
-    pygame.quit()
+
+    pygame.quit() # Uninitialize Pygame modules
+    print("Application finished.")
     sys.exit()
 
+
+# --- Main execution ---
 if __name__ == '__main__':
-    print(f"Starting {GAME_TITLE} (v15.0 - Resolution)...")
+    print(f"Starting {GAME_TITLE} (v15.2 - Config Save & Volume)...")
     print(f"Networking: {MAX_PLAYERS} players max, Port {DEFAULT_PORT}")
     print(f"Default Resolution Index: {DEFAULT_RESOLUTION_INDEX}, Default Net Interval: {DEFAULT_NETWORK_UPDATE_INTERVAL:.3f}s")
     try:
         main()
     except Exception as e:
-        print("\n--- UNEXPECTED ERROR ---")
+        print("\n--- UNHANDLED TOP-LEVEL ERROR ---")
         import traceback
-
         traceback.print_exc()
-        print("------------------------")
+        print("---------------------------------")
         try:
-            pygame.quit()
+            pygame.quit() # Attempt to cleanup pygame if possible
         except Exception:
             pass
-        sys.exit("Exited due to error.")
+        sys.exit("Exited due to critical error.")
