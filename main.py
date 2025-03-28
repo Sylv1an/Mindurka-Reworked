@@ -51,6 +51,8 @@ DEFAULT_MUSIC_VOLUME = 0.6 # Volume from 0.0 to 1.0
 
 #UI
 CONFIG_FILENAME = "config.json"
+SAVE_FILENAME_SP = "save_sp.json"
+SAVE_FILENAME_HOST = "save_host.json"
 UI_HEIGHT = 140
 FPS = 60
 GAME_TITLE = "Mindurka Reworked"
@@ -1258,7 +1260,7 @@ class SettingsMenu:
 
 # --- Game Class ---
 class Game:
-    def __init__(self, screen, clock, player_settings, network_mode="sp", server=None, client=None):
+    def __init__(self, screen, clock, player_settings, network_mode="sp", server=None, client=None, load_data=None): # Added load_data
         self.screen = screen
         current_screen_width = screen.get_width()
         current_screen_height = screen.get_height()
@@ -1274,19 +1276,44 @@ class Game:
         self.network_mode = network_mode
         self.server = server
         self.client = client
-        self.running = True
-        self.game_over = False
-        self.game_won = False
-        self.resources = {RES_COPPER: STARTING_COPPER, RES_COAL: STARTING_COAL}
+        self.running = True # Controls if the game state itself should continue (e.g., for ESC)
+
+        # --- Initialize based on load_data or defaults ---
+        if load_data:
+            print("Initializing game from loaded save data...")
+            # Initialize core attributes from loaded data first
+            self.resources = load_data.get('resources', {RES_COPPER: STARTING_COPPER, RES_COAL: STARTING_COAL})
+            self.wave_number = load_data.get('wave_number', 0)
+            self.wave_timer = load_data.get('wave_timer', WAVE_COOLDOWN)
+            self.in_wave = load_data.get('in_wave', False)
+            self.game_over = load_data.get('game_over', False) # Load end game status
+            self.game_won = load_data.get('game_won', False)
+            # Other state (structures, players) initialized later via apply_full_snapshot
+        else:
+            print("Initializing new game...")
+            # Default initialization for a new game
+            self.resources = {RES_COPPER: STARTING_COPPER, RES_COAL: STARTING_COAL}
+            self.wave_number = 0
+            self.wave_timer = WAVE_COOLDOWN
+            self.in_wave = False
+            self.game_over = False
+            self.game_won = False
+        # --- END MODIFIED ---
+
+        # --- Initialize containers (always needed) ---
         self.grid = [[None for _ in range(self.grid_height)] for _ in range(self.grid_width)]
-        self.structures = {}
-        self.enemies = {}
-        self.projectiles = {}
+        self.structures = {} # network_id -> Structure object
+        self.enemies = {}    # network_id -> Enemy object
+        self.projectiles = {}# network_id -> Projectile object
         self.core = None
-        self.base_terrain = {}
-        self.players = {}
-        self.local_player_id = None
-        self.dt = 0.0
+        self.base_terrain = {} # (gx, gy) -> RES_TYPE (only stores resource patches)
+        self.players = {}      # player_id -> Player object
+        # ------------------------------------------
+
+        self.local_player_id = None # Will be set based on mode/load/network assignment
+        self.dt = 0.0               # Delta time for current frame
+
+        # --- UI/Input State ---
         self.selected_building_type = BUILDING_NONE
         self.selected_orientation = EAST
         self.building_info = {
@@ -1301,467 +1328,692 @@ class Game:
         }
         self.key_to_building_type = {pygame.K_0 + i: bt for i, bt in enumerate(self.building_info.keys(), 1)}
         self.preview_instances = self._create_preview_instances()
+        # --- End UI/Input ---
+
+        # --- Power Grid State ---
         self.power_nodes = []
         self.power_consumers = []
         self.power_grid_update_timer = 0.0
-        self.power_grid_update_interval = 0.3
+        self.power_grid_update_interval = POWER_NETWORK_STATS_UPDATE_INTERVAL
         self.hovered_power_node_id = None
         self.network_stats = None
         self.network_stats_timer = 0.0
-        self.wave_number = 0
-        self.wave_timer = WAVE_COOLDOWN
-        self.in_wave = False
+        # --- End Power Grid ---
+
+        # --- Wave/Enemy State ---
+        # wave_number, wave_timer, in_wave initialized earlier based on load_data
         self.enemies_to_spawn_this_wave = 0
         self.enemies_spawned_this_wave = 0
-        self.enemy_spawn_timer = 0
-        self.current_enemy_hp = ENEMY_START_HP
+        self.enemy_spawn_timer = 0.0
+        self.current_enemy_hp = ENEMY_START_HP # Will be updated based on wave number
         self.max_waves = MAX_WAVES
-        self.next_enemy_id = 0
-        self.next_projectile_id = 0
+        # Load next IDs from save data if available, else start at 0
+        self.next_enemy_id = load_data.get('next_enemy_id', 0) if load_data else 0
+        self.next_projectile_id = load_data.get('next_projectile_id', 0) if load_data else 0
+        # --- End Wave/Enemy ---
+
+        # --- Music Attributes ---
         self.game_music_files = sorted(glob.glob(GAME_MUSIC_FILES_PATTERN))
-        self.current_song_index = -1  # No song selected initially
-        self.music_playing = False  # Tracks if we intend it to play (vs mixer's state)
+        self.current_song_index = -1 # No song selected initially
+        self.music_playing = False # Tracks if we intend it to play (vs mixer's state)
         self.prev_button_rect = None
         self.play_pause_button_rect = None
         self.next_button_rect = None
-        self.current_volume = DEFAULT_MUSIC_VOLUME  # Track volume (0.0 to 1.0)
+        # Volume Slider Attributes
+        # Use volume from player_settings (app_config) passed during creation
+        self.current_volume = player_settings.get('volume', DEFAULT_MUSIC_VOLUME)
         self.volume_slider_track_rect = None
         self.volume_slider_handle_rect = None
-        self.dragging_volume = False  # Is the user currently dragging the handle?
-        self._setup_music_controls_ui()  # Calculate initial button positions
+        self.dragging_volume = False # Is the user currently dragging the handle?
+        # Calculate initial UI positions (includes slider now)
+        self._setup_music_controls_ui()
         if self.game_music_files:
             print(f"Found game music: {', '.join([os.path.basename(f) for f in self.game_music_files])}")
         else:
             print("WARN: No game music files found matching pattern.")
-        # Ensure volume is set (might be redundant if set in main)
+        # Set initial mixer volume for the game instance
         try:
             pygame.mixer.music.set_volume(self.current_volume)
         except pygame.error as e:
-            print(f"WARN: Error setting game music volume: {e}")
+            print(f"WARN: Error setting initial game music volume: {e}")
+        # --- END Music Attributes ---
 
-        if self.network_mode in ["sp", "host"]:
-            self.local_player_id = 0
-            self.setup_world()
-            if self.network_mode == "host" and self.server:
-                 if self.server.initial_snapshot is None: # Set snapshot only if not already set (e.g., by main loop)
-                     self.server.initial_snapshot = self.get_full_snapshot()
-        elif self.network_mode == "client":
-             print("CLIENT: Waiting for initial game state from server...")
 
-    def _setup_music_controls_ui(self):
-        """Calculates the positions for music control buttons and volume slider."""
-        screen_w = self.screen.get_width()
-        btn_size = 28
-        margin = 10
-        slider_height = 8
-        slider_width = 80 # Width of the slider track
-        handle_height = 16
-        handle_width = 10
-        slider_bottom_margin = 8 # Space between slider and buttons
-
-        # --- Slider Positioning ---
-        slider_y = 10 # Position from the top
-        slider_x = screen_w - margin - slider_width # Align right edge with button area start
-
-        self.volume_slider_track_rect = pygame.Rect(slider_x, slider_y, slider_width, slider_height)
-
-        # Initial handle position based on current_volume
-        handle_center_x = slider_x + int(self.current_volume * slider_width)
-        handle_y = slider_y + (slider_height / 2) - (handle_height / 2) # Center handle vertically on track
-        self.volume_slider_handle_rect = pygame.Rect(0, handle_y, handle_width, handle_height)
-        self.volume_slider_handle_rect.centerx = handle_center_x # Set center x after creating rect
-
-        # --- Button Positioning (relative to slider) ---
-        buttons_y = slider_y + slider_height + slider_bottom_margin
-        buttons_x_start = screen_w - margin - (btn_size * 3 + margin * 2) # Recalculate for clarity
-
-        self.prev_button_rect = pygame.Rect(buttons_x_start, buttons_y, btn_size, btn_size)
-        self.play_pause_button_rect = pygame.Rect(buttons_x_start + btn_size + margin, buttons_y, btn_size, btn_size)
-        self.next_button_rect = pygame.Rect(buttons_x_start + (btn_size + margin) * 2, buttons_y, btn_size, btn_size)
-
-    def load_and_play_song(self, index):
-        """Loads and plays a song by index from the game music list."""
-        if not self.game_music_files or not (0 <= index < len(self.game_music_files)):
-            print("WARN: Invalid song index or no music files.")
-            self.current_song_index = -1
-            self.music_playing = False
+        # --- Setup based on mode and load_data ---
+        if self.network_mode == "client":
+            # Client always waits for server state, no local setup needed here
+            print("CLIENT: Waiting for initial game state from server...")
+            # local_player_id will be assigned by server message
+        elif load_data:
+            # Apply the rest of the loaded state (structures, players, etc.)
+            # We use apply_full_snapshot as it handles creating objects
+            print("Applying snapshot from loaded save data...")
             try:
-                pygame.mixer.music.stop()
-            except pygame.error:
-                pass  # Ignore if mixer not ready
-            return
+                # apply_full_snapshot will populate self.structures, self.players, etc.
+                # It also handles self.base_terrain and self.core
+                self.apply_full_snapshot(load_data)
 
-        self.current_song_index = index
-        song_path = self.game_music_files[self.current_song_index]
-        try:
-            print(f"MUSIC: Loading '{os.path.basename(song_path)}'")
-            pygame.mixer.music.load(song_path)
-            pygame.mixer.music.play(0)  # Play once
-            pygame.mixer.music.set_endevent(MUSIC_END_EVENT)  # Ensure end event is set
-            self.music_playing = True
-        except pygame.error as e:
-            print(f"ERROR: Could not load/play music '{song_path}': {e}")
-            self.music_playing = False
-            self.current_song_index = -1
+                # --- Post-Load Validation ---
+                # Ensure local player ID is set correctly for loaded SP/Host game
+                self.local_player_id = 0 # Host/SP is always player 0
+                if self.local_player_id not in self.players:
+                     print("WARN: Player 0 not found in loaded save data for SP/Host. Creating default.")
+                     # Create a default player 0 if missing, perhaps near core
+                     px, py = (self.core.center_x, self.core.center_y - TILE_SIZE * 2) if self.core else (self.map_width_px/2, self.map_height_px/2)
+                     pname = self.player_settings.get('name', "Player0") # Use current config name
+                     cidx = self.player_settings.get('color_index', 0)  # Use current config color
+                     self.players[self.local_player_id] = Player(px, py, self.local_player_id, name=pname, color_index=cidx)
+                else:
+                     # Optional: Update loaded player 0's name/color from current config?
+                     # player0 = self.players[self.local_player_id]
+                     # player0.name = self.player_settings.get('name', player0.name)
+                     # player0.color_index = self.player_settings.get('color_index', player0.color_index)
+                     # player0.color = COLOR_PLAYER_OPTIONS[player0.color_index % len(COLOR_PLAYER_OPTIONS)]
+                     pass # Decide if player appearance should update on load
 
-    def play_next_song(self):
-        """Plays the next song in the list, wrapping around."""
-        if not self.game_music_files: return
-        next_index = (self.current_song_index + 1) % len(self.game_music_files)
-        self.load_and_play_song(next_index)
+                # Recalculate derived state after loading
+                if self.network_mode != "client": # SP or Host
+                     self._rebuild_power_lists() # Populate power lists from loaded structures
+                # Update current_enemy_hp based on loaded wave number
+                self.current_enemy_hp = ENEMY_START_HP + max(0, self.wave_number - 1) * ENEMY_HP_INCREASE_PER_WAVE
+                print(f"Applied loaded save data snapshot. NextEnemyID: {self.next_enemy_id}, Wave: {self.wave_number}")
+                # --- End Post-Load Validation ---
 
-    def play_prev_song(self):
-        """Plays the previous song in the list, wrapping around."""
-        if not self.game_music_files: return
-        prev_index = (self.current_song_index - 1) % len(self.game_music_files)
-        self.load_and_play_song(prev_index)
+            except Exception as e:
+                print(f"ERROR applying loaded save data snapshot: {e}. Starting new game instead.")
+                import traceback; traceback.print_exc() # More detailed error
+                # Fallback to new game setup if loading fails badly
+                self.resources = {RES_COPPER: STARTING_COPPER, RES_COAL: STARTING_COAL} # Reset basic state
+                self.wave_number = 0; self.wave_timer = WAVE_COOLDOWN; self.in_wave = False
+                self.game_over = False; self.game_won = False
+                self.enemies = {}; self.projectiles = {}; self.structures = {} # Clear containers
+                self.grid = [[None for _ in range(self.grid_height)] for _ in range(self.grid_width)] # Reset grid
+                self.next_enemy_id = 0; self.next_projectile_id = 0
+                self.local_player_id = 0 # Ensure local ID is set for new game
+                self.setup_world() # Run new game setup
 
-    def toggle_pause(self):
-        """Toggles pause/unpause for the game music."""
-        if not self.game_music_files or self.current_song_index == -1:
-            # Try starting the first song if none is playing
-            if self.game_music_files:
-                print("MUSIC: No song active, starting first song.")
-                self.load_and_play_song(0)
-            return
+        else: # New Game Setup (SP or Host)
+            self.local_player_id = 0 # Host/SP starts as player 0
+            self.setup_world() # Creates core, initial player 0, resources
+            if self.network_mode == "host" and self.server:
+                 if self.server.initial_snapshot is None:
+                     # Ensure snapshot reflects the newly created world
+                     # Needs lock? Server might access this immediately.
+                     with self.server.game_lock:
+                         self.server.initial_snapshot = self.get_full_snapshot()
+                     print("HOST: Initial snapshot created for new game.")
+        # --- End Setup ---
 
-        try:
-            if self.music_playing:  # If we think it's playing, pause it
-                pygame.mixer.music.pause()
-                self.music_playing = False
-                print("MUSIC: Paused")
-            else:  # If we think it's paused (or stopped), unpause it
-                # Check if the mixer actually stopped (e.g. song ended) vs paused
-                if pygame.mixer.music.get_busy():
-                    pygame.mixer.music.unpause()
-                    self.music_playing = True
-                    print("MUSIC: Unpaused")
-                else:  # If it wasn't busy, it likely finished, start current (or next) song again
-                    print("MUSIC: Song finished or stopped, restarting current.")
-                    # Option 1: Restart current song
-                    self.load_and_play_song(self.current_song_index)
-                    # Option 2: Play next song (if desired behavior)
-                    # self.play_next_song()
-
-        except pygame.error as e:
-            print(f"ERROR: Music pause/unpause error: {e}")
-
-    def handle_music_end_event(self):
-        """Called from main loop when MUSIC_END_EVENT is received."""
-        print("MUSIC: Song finished, playing next.")
-        # When a song naturally ends, automatically play the next one
-        self.music_playing = False  # Mark as not playing before starting next
-        self.play_next_song()
 
     def _create_preview_instances(self):
+        """Creates dummy instances of buildings for UI preview."""
         previews = {}
         for bt, info in self.building_info.items():
+             # Provide necessary args for constructor, default orientation if needed
              args = (0, 0, self.selected_orientation) if bt == BUILDING_CONVEYOR else (0, 0)
              try:
+                 # Use info['class'] which holds the actual class type
                  instance = info['class'](*args)
-                 instance.tier = 1
-                 if hasattr(instance, 'update_stats'): instance.update_stats()
+                 instance.tier = 1 # Set default tier for preview
+                 # Call update_stats if the preview instance has it (for correct HP/visuals)
+                 if hasattr(instance, 'update_stats'):
+                     instance.update_stats()
                  previews[bt] = instance
-             except Exception as e: print(f"Error creating preview instance for {info['name']}: {e}")
+             except Exception as e:
+                 print(f"Error creating preview instance for {info['name']}: {e}")
         return previews
 
-    def get_next_enemy_id(self): self.next_enemy_id += 1; return f"e_{self.next_enemy_id}"
-    def get_next_projectile_id(self): self.next_projectile_id += 1; return f"p_{self.next_projectile_id}"
+    def get_next_enemy_id(self):
+        """Generates a unique network ID for a new enemy (Server/SP)."""
+        self.next_enemy_id += 1
+        return f"e_{self.next_enemy_id}"
+
+    def get_next_projectile_id(self):
+        """Generates a unique network ID for a new projectile (Server/SP)."""
+        self.next_projectile_id += 1
+        return f"p_{self.next_projectile_id}"
 
     def setup_world(self):
-        print(f"SERVER/SP: Setting up world for grid {self.grid_width}x{self.grid_height}...")
+        """Initializes a new game world (Server/SP only)."""
+        if self.network_mode == "client": return # Clients receive world state
+
+        print(f"SERVER/SP: Setting up NEW world for grid {self.grid_width}x{self.grid_height}...")
+        self.base_terrain.clear()
+        self.structures.clear()
+        self.enemies.clear()
+        self.projectiles.clear()
+        self.players.clear()
+        self.grid = [[None for _ in range(self.grid_height)] for _ in range(self.grid_width)] # Clear grid
+
+        # --- Place Core ---
         core_gx = self.grid_width // 2
-        core_gy = self.grid_height - 4
+        core_gy = self.grid_height - 4 # Place near bottom middle
+        # Clamp core position to be valid
         core_gx = max(0, min(core_gx, self.grid_width - 1))
         core_gy = max(0, min(core_gy, self.grid_height - 1))
         self.core = Core(core_gx, core_gy)
-        self._add_structure_to_game(self.core)
+        self._add_structure_to_game(self.core) # Add core to grid and structures dict
 
-        player_start_x, player_start_y = grid_to_world_center(core_gx, core_gy - 2)
+        # --- Place Initial Player (Player 0) ---
+        player_start_x, player_start_y = grid_to_world_center(core_gx, core_gy - 2) # Start near core
+        # Clamp player start position
         player_start_x = max(TILE_SIZE, min(player_start_x, self.map_width_px - TILE_SIZE))
         player_start_y = max(TILE_SIZE, min(player_start_y, self.map_height_px - TILE_SIZE))
+        # Use current config for player name/color
         player_name = self.player_settings.get('name', "Player0")
         color_index = self.player_settings.get('color_index', 0)
         host_player = Player(player_start_x, player_start_y, self.local_player_id, name=player_name, color_index=color_index)
         self.players[self.local_player_id] = host_player
 
-        num_patches = int(65 * (self.grid_width * self.grid_height) / (40*19)) # Scale roughly with area
-        min_dist_from_core = 6; coal_ratio = 4; placed_patches = 0; max_attempts_total = num_patches * 150; current_attempts = 0
+        # --- Generate Resource Patches ---
+        # Scale number of patches roughly with map area
+        num_patches = int(65 * (self.grid_width * self.grid_height) / (40*19))
+        min_dist_from_core_sq = (6 * TILE_SIZE)**2 # Min distance from core center
+        coal_ratio = 4 # Roughly 1 coal for every 3 copper
+        placed_patches = 0
+        max_attempts_total = num_patches * 150 # Limit attempts to prevent infinite loop
+        current_attempts = 0
+
+        core_center_x, core_center_y = self.core.center_x, self.core.center_y
+
         while placed_patches < num_patches and current_attempts < max_attempts_total:
             current_attempts += 1
-            res_type = RES_COAL if placed_patches % coal_ratio == 0 else RES_COPPER
+            res_type = RES_COAL if (placed_patches + 1) % coal_ratio == 0 else RES_COPPER
+            # Choose random grid location, avoiding edges slightly
             gx = random.randint(1, self.grid_width - 2)
             gy = random.randint(1, self.grid_height - 2)
-            if gx == core_gx and gy == core_gy: continue # Avoid placing on core
-            is_tile_free = (self.grid[gx][gy] is None)
-            dist_ok = (distance(gx, gy, core_gx, core_gy) > min_dist_from_core)
+
+            # Check if tile is empty (no structure or existing base terrain)
+            is_tile_free = (self.grid[gx][gy] is None and (gx, gy) not in self.base_terrain)
+            # Check distance from core
+            patch_center_x, patch_center_y = grid_to_world_center(gx, gy)
+            dist_sq = distance_sq(patch_center_x, patch_center_y, core_center_x, core_center_y)
+            dist_ok = (dist_sq > min_dist_from_core_sq)
+
             if is_tile_free and dist_ok:
+                # Check immediate neighbors (including diagonals) for other resources to prevent clumping
                 is_clear_around = True
                 for dx in [-1, 0, 1]:
                     for dy in [-1, 0, 1]:
                         if dx == 0 and dy == 0: continue
                         nx, ny = gx + dx, gy + dy
+                        # Check bounds and if neighbor is already a resource patch
                         if 0 <= nx < self.grid_width and 0 <= ny < self.grid_height:
-                            if self.grid[nx][ny] is not None and self.grid[nx][ny].building_type != BUILDING_RESOURCE:
+                            if (nx, ny) in self.base_terrain:
                                 is_clear_around = False; break
-                    if not is_clear_around: continue
+                    if not is_clear_around: continue # Skip if neighbor is resource
+
                 if is_clear_around:
+                    # Place the patch
                     self.base_terrain[(gx, gy)] = res_type
-                    patch = ResourcePatch(gx, gy, res_type)
+                    # Create a ResourcePatch object for drawing, but don't store in self.structures
+                    patch_obj = ResourcePatch(gx, gy, res_type)
                     if 0 <= gx < self.grid_width and 0 <= gy < self.grid_height:
-                        self.grid[gx][gy] = patch
+                        self.grid[gx][gy] = patch_obj # Place visual representation on grid
                     placed_patches += 1
-        print(f"SERVER/SP: World setup complete. {placed_patches}/{num_patches} resource patches placed.")
 
+        print(f"SERVER/SP: New world setup complete. {placed_patches}/{num_patches} resource patches placed.")
+        # --- End Resource Generation ---
 
-    # --- Structure Management Methods (_add_structure_to_game, _remove_structure_from_game, action_*, etc.) ---
-    # (Keep these methods exactly as they were in the previous corrected version, ensuring they use self.grid_width/height bounds where applicable)
+        self._rebuild_power_lists() # Ensure power lists are correct after setup
+
+    # --- Structure Management Methods ---
     def get_structure_at(self, gx, gy):
+        """Gets the structure object at the given grid coordinates, if any."""
         if 0 <= gx < self.grid_width and 0 <= gy < self.grid_height:
             return self.grid[gx][gy]
         return None
 
-    def get_structure_by_id(self, network_id): return self.structures.get(network_id)
+    def get_structure_by_id(self, network_id):
+        """Gets a structure object by its unique network ID."""
+        return self.structures.get(network_id)
 
     def _add_structure_to_game(self, structure_obj):
+        """Adds a structure to the grid and internal dictionary. Handles overwriting/drills on patches."""
         gx, gy = structure_obj.grid_x, structure_obj.grid_y
-        if not (0 <= gx < self.grid_width and 0 <= gy < self.grid_height): return False
-        existing = self.grid[gx][gy]
-        is_drill_on_patch = isinstance(structure_obj, Drill) and isinstance(existing, ResourcePatch)
-        if existing is not None and not is_drill_on_patch and existing.network_id in self.structures:
-             self._remove_structure_from_game(existing)
+        if not (0 <= gx < self.grid_width and 0 <= gy < self.grid_height):
+            print(f"WARN: Attempted to add structure outside grid bounds ({gx},{gy})")
+            return False
+
+        existing_on_grid = self.grid[gx][gy]
+        is_drill_on_patch = isinstance(structure_obj, Drill) and isinstance(existing_on_grid, ResourcePatch)
+
+        # If placing something other than a drill, or placing a drill on non-patch, remove existing structure first
+        if not is_drill_on_patch and existing_on_grid is not None and existing_on_grid.building_type != BUILDING_RESOURCE:
+            print(f"INFO: Overwriting existing structure {type(existing_on_grid).__name__} at ({gx},{gy})")
+            self._remove_structure_from_game(existing_on_grid) # Remove from dicts and power lists
+
+        # Place new structure on grid
         self.grid[gx][gy] = structure_obj
+        # Add to structures dictionary using its network ID
         self.structures[structure_obj.network_id] = structure_obj
-        if self.network_mode != "client": self._update_power_lists_add(structure_obj)
-        if isinstance(structure_obj, Drill) and self.network_mode != "client": structure_obj.setup_on_patch(self)
+
+        # Update power network tracking (Server/SP only)
+        if self.network_mode != "client":
+            self._update_power_lists_add(structure_obj)
+
+        # Special setup for drills (Server/SP only)
+        if isinstance(structure_obj, Drill) and self.network_mode != "client":
+            structure_obj.setup_on_patch(self) # Checks if it's on a valid patch type
+
+        # print(f"DEBUG: Added {type(structure_obj).__name__} ({structure_obj.network_id}) at ({gx},{gy})")
         return True
 
     def _remove_structure_from_game(self, structure_obj):
+        """Removes a structure from the grid and internal dictionary."""
         if structure_obj is None: return
         gx, gy = structure_obj.grid_x, structure_obj.grid_y
-        if structure_obj.network_id in self.structures: del self.structures[structure_obj.network_id]
-        if self.network_mode != "client": self._update_power_lists_remove(structure_obj)
+        removed_id = structure_obj.network_id
+
+        # Remove from structures dictionary
+        if removed_id in self.structures:
+            del self.structures[removed_id]
+            # print(f"DEBUG: Removed {type(structure_obj).__name__} ({removed_id}) from dict.")
+        else:
+            # This might happen if removing a ResourcePatch visual, which isn't in self.structures
+            # print(f"DEBUG: Structure {removed_id} not found in dict during removal.")
+            pass
+
+        # Update power network tracking (Server/SP only)
+        if self.network_mode != "client":
+            self._update_power_lists_remove(structure_obj)
+
+        # Update grid display: Replace with ResourcePatch if base terrain exists, else None
         if 0 <= gx < self.grid_width and 0 <= gy < self.grid_height and self.grid[gx][gy] == structure_obj:
-             base_type = self.base_terrain.get((gx, gy))
-             self.grid[gx][gy] = ResourcePatch(gx, gy, base_type) if base_type else None
+             base_type = self.base_terrain.get((gx, gy)) # Check if it was originally a resource patch
+             if base_type:
+                 self.grid[gx][gy] = ResourcePatch(gx, gy, base_type) # Restore visual patch
+             else:
+                 self.grid[gx][gy] = None # Clear the grid cell
+
+    def _rebuild_power_lists(self):
+        """Re-populates the power_nodes and power_consumers lists from self.structures. (Server/SP only)"""
+        if self.network_mode == "client": return
+        self.power_nodes.clear()
+        self.power_consumers.clear()
+        for struct in self.structures.values():
+            if struct.is_power_node:
+                self.power_nodes.append(struct)
+            if struct.is_power_consumer:
+                self.power_consumers.append(struct)
+        print(f"DEBUG: Rebuilt power lists: {len(self.power_nodes)} nodes, {len(self.power_consumers)} consumers.")
 
     def _update_power_lists_add(self, obj):
-        if obj.is_power_node and obj not in self.power_nodes: self.power_nodes.append(obj)
-        if obj.is_power_consumer and obj not in self.power_consumers: self.power_consumers.append(obj)
+        """Adds a structure to power lists if applicable (Server/SP only)."""
+        if self.network_mode == "client": return
+        if obj.is_power_node and obj not in self.power_nodes:
+            self.power_nodes.append(obj)
+        if obj.is_power_consumer and obj not in self.power_consumers:
+            self.power_consumers.append(obj)
 
     def _update_power_lists_remove(self, obj):
-        if obj.is_power_node and obj in self.power_nodes: self.power_nodes.remove(obj)
-        if obj.is_power_consumer and obj in self.power_consumers: self.power_consumers.remove(obj)
+        """Removes a structure from power lists if applicable (Server/SP only)."""
+        if self.network_mode == "client": return
+        if obj.is_power_node and obj in self.power_nodes:
+            try: self.power_nodes.remove(obj)
+            except ValueError: pass # Ignore if already removed somehow
+        if obj.is_power_consumer and obj in self.power_consumers:
+            try: self.power_consumers.remove(obj)
+            except ValueError: pass
 
+    # --- Player Actions (Server/SP Authoritative Logic) ---
     def action_place_structure(self, player_id, building_type, gx, gy, orientation):
-        player = self.players.get(player_id); info = self.building_info.get(building_type)
+        """Attempts to place a structure, called by server/SP based on input."""
+        if self.network_mode == "client": return False # Clients don't execute actions directly
+        player = self.players.get(player_id)
+        info = self.building_info.get(building_type)
         if not player or not info or building_type == BUILDING_NONE: return False
+
+        # 1. Check Validity: Bounds, Cost, Radius, Tile Occupation
         if not (0 <= gx < self.grid_width and 0 <= gy < self.grid_height): return False
         cost = info['cost']
         if not all(self.resources.get(res, 0) >= amount for res, amount in cost.items()): return False
-        tcx, tcy = grid_to_world_center(gx, gy); radius_sq = PLAYER_BUILD_RADIUS * PLAYER_BUILD_RADIUS
-        if distance_sq(player.world_x, player.world_y, tcx, tcy) > radius_sq: return False
-        existing = self.get_structure_at(gx, gy); klass = info['class']
-        is_drill_on_patch = (klass == Drill and isinstance(existing, ResourcePatch))
+        target_center_x, target_center_y = grid_to_world_center(gx, gy)
+        radius_sq = PLAYER_BUILD_RADIUS * PLAYER_BUILD_RADIUS
+        if distance_sq(player.world_x, player.world_y, target_center_x, target_center_y) > radius_sq: return False
+
+        existing = self.get_structure_at(gx, gy)
+        BuildingClass = info['class']
+        is_drill_on_patch = (BuildingClass == Drill and isinstance(existing, ResourcePatch))
         is_empty = (existing is None)
-        if not (is_drill_on_patch or (is_empty and klass != Drill)): return False
-        print(f"SERVER: Player {player_id} placing {info['name']} at ({gx},{gy})")
+
+        # Allow placing drills only on resource patches, other buildings only on empty tiles
+        if not (is_drill_on_patch or (is_empty and BuildingClass != Drill)):
+            # print(f"DEBUG: Placement failed - Invalid tile target for {BuildingClass.__name__} at ({gx},{gy}). Existing: {type(existing).__name__ if existing else 'None'}")
+            return False
+
+        # 2. Deduct Cost & Create Structure
+        print(f"SERVER/SP: Player {player_id} placing {info['name']} at ({gx},{gy})")
         for res, amount in cost.items(): self.resources[res] -= amount
-        NewClass = klass
-        new = NewClass(gx, gy, orientation) if building_type == BUILDING_CONVEYOR else NewClass(gx, gy)
-        if not self._add_structure_to_game(new):
-            print(f"ERROR: Server failed add {info['name']}!"); [self.resources.update({res: self.resources.get(res,0)+amount}) for res, amount in cost.items()] ; return False
+
+        # Instantiate the new building
+        new_structure = None
+        try:
+             if building_type == BUILDING_CONVEYOR:
+                 new_structure = BuildingClass(gx, gy, orientation)
+             else:
+                 new_structure = BuildingClass(gx, gy)
+        except Exception as e:
+             print(f"ERROR: Failed to instantiate {BuildingClass.__name__}: {e}")
+             # Refund cost if instantiation failed
+             for res, amount in cost.items(): self.resources[res] += amount
+             return False
+
+        # 3. Add to Game State
+        if not self._add_structure_to_game(new_structure):
+            print(f"ERROR: Server/SP failed _add_structure_to_game for {info['name']}!")
+            # Refund cost if adding failed
+            for res, amount in cost.items(): self.resources[res] += amount
+            return False
+
+        # 4. Broadcast (Host only)
         if self.network_mode == "host" and self.server:
-            state = new.get_state();
-            if state: self.server.broadcast_message({'type': 'structure_add', 'data': state})
+            state = new_structure.get_state();
+            if state:
+                self.server.broadcast_message({'type': 'structure_add', 'data': state})
+            else:
+                 print(f"WARN: Failed to get state for new structure {new_structure.network_id}")
+
         return True
 
     def action_remove_structure(self, player_id, gx, gy):
-        player = self.players.get(player_id); struct = self.get_structure_at(gx, gy)
-        if not player or not struct or struct.building_type in [BUILDING_CORE, BUILDING_RESOURCE]: return False
-        tcx, tcy = grid_to_world_center(gx, gy); radius_sq = PLAYER_BUILD_RADIUS * PLAYER_BUILD_RADIUS
-        if distance_sq(player.world_x, player.world_y, tcx, tcy) > radius_sq: return False
-        print(f"SERVER: Player {player_id} removing {type(struct).__name__} at ({gx},{gy})")
-        for res, amount in struct.cost.items():
+        """Attempts to remove a structure, called by server/SP based on input."""
+        if self.network_mode == "client": return False
+        player = self.players.get(player_id)
+        struct_to_remove = self.get_structure_at(gx, gy)
+        if not player or not struct_to_remove: return False
+
+        # 1. Check Validity: Cannot remove Core or Resource Patches, Check Radius
+        if struct_to_remove.building_type in [BUILDING_CORE, BUILDING_RESOURCE]: return False
+        target_center_x, target_center_y = grid_to_world_center(gx, gy)
+        radius_sq = PLAYER_BUILD_RADIUS * PLAYER_BUILD_RADIUS
+        if distance_sq(player.world_x, player.world_y, target_center_x, target_center_y) > radius_sq: return False
+
+        # 2. Refund Resources & Remove Structure
+        print(f"SERVER/SP: Player {player_id} removing {type(struct_to_remove).__name__} at ({gx},{gy})")
+        for res, amount in struct_to_remove.cost.items():
             self.resources[res] = self.resources.get(res, 0) + int(amount * DELETE_REFUND_RATIO)
-        removed_id = struct.network_id; self._remove_structure_from_game(struct)
+
+        removed_id = struct_to_remove.network_id # Get ID before removing
+        self._remove_structure_from_game(struct_to_remove)
+
+        # 3. Broadcast (Host only)
         if self.network_mode == "host" and self.server:
             self.server.broadcast_message({'type': 'structure_remove', 'net_id': removed_id})
+
         return True
 
     def action_upgrade_structure(self, player_id, gx, gy):
-        player = self.players.get(player_id); target = self.get_structure_at(gx, gy)
+        """Attempts to upgrade a structure, called by server/SP based on input."""
+        if self.network_mode == "client": return False
+        player = self.players.get(player_id)
+        target = self.get_structure_at(gx, gy)
         if not player or not target: return False
-        tcx, tcy = grid_to_world_center(gx, gy); radius_sq = PLAYER_BUILD_RADIUS * PLAYER_BUILD_RADIUS
-        if distance_sq(player.world_x, player.world_y, tcx, tcy) > radius_sq: return False
+
+        # 1. Check Validity: Radius, Can Upgrade?, Afford Cost
+        target_center_x, target_center_y = grid_to_world_center(gx, gy)
+        radius_sq = PLAYER_BUILD_RADIUS * PLAYER_BUILD_RADIUS
+        if distance_sq(player.world_x, player.world_y, target_center_x, target_center_y) > radius_sq: return False
         if not target.can_upgrade(): return False
+
         cost = target.get_next_upgrade_cost();
-        if cost is None: return False
+        if cost is None: return False # Should be caught by can_upgrade, but safety check
         if not all(self.resources.get(res, 0) >= amount for res, amount in cost.items()): return False
+
+        # 2. Deduct Cost & Apply Upgrade
         for res, amount in cost.items(): self.resources[res] -= amount
-        was_consumer = target.is_power_consumer; was_node = target.is_power_node
-        success = target.apply_upgrade(self)
+
+        # Store power status before upgrade
+        was_consumer = target.is_power_consumer
+        was_node = target.is_power_node
+
+        success = target.apply_upgrade(self) # This increments tier and updates stats
+
+        # 3. Handle State Changes & Broadcast
         if success:
+            # Update power lists if role changed (Server/SP only)
             if self.network_mode != "client":
                 if (target.is_power_consumer != was_consumer or target.is_power_node != was_node):
-                    self._update_power_lists_remove(target); self._update_power_lists_add(target)
+                    print(f"DEBUG: Power role changed for {target.network_id} on upgrade.")
+                    self._update_power_lists_remove(target) # Remove with old role
+                    self._update_power_lists_add(target)    # Add with new role
+
+            # Broadcast updated state (Host only)
             if self.network_mode == "host" and self.server:
                  state = target.get_state()
-                 if state: self.server.broadcast_message({'type': 'structure_update', 'data': state})
-        else: print(f"ERROR: Server apply_upgrade failed!"); [self.resources.update({res: self.resources.get(res,0)+amount}) for res, amount in cost.items()]
+                 if state:
+                     self.server.broadcast_message({'type': 'structure_update', 'data': state})
+                 else:
+                      print(f"WARN: Failed to get state for upgraded structure {target.network_id}")
+        else:
+            # If upgrade failed internally (shouldn't happen if checks pass), refund cost
+            print(f"ERROR: Server/SP apply_upgrade method failed unexpectedly for {target.network_id}!")
+            for res, amount in cost.items(): self.resources[res] += amount
+
         return success
+    # --- End Player Actions ---
+
 
     # --- Enemy & Projectile Management ---
-    # (get_enemy_by_id, get_projectile_by_id, spawn_enemy remain the same)
-    def get_enemy_by_id(self, network_id): return self.enemies.get(network_id)
+    def get_enemy_by_id(self, network_id):
+        """Gets an enemy object by its unique network ID."""
+        return self.enemies.get(network_id)
 
-    def get_projectile_by_id(self, network_id): return self.projectiles.get(network_id)
+    def get_projectile_by_id(self, network_id):
+        """Gets a projectile object by its unique network ID."""
+        return self.projectiles.get(network_id)
 
     def spawn_enemy(self):
+        """Creates a new enemy at the edge of the map (Server/SP only)."""
         if self.network_mode == "client": return
-        edge = random.choice(['top', 'left', 'right']); margin = TILE_SIZE * 2; sx, sy = 0.0, 0.0
-        if edge == 'top': sx = random.uniform(margin, self.map_width_px - margin); sy = -margin
-        elif edge == 'left': sx = -margin; sy = random.uniform(margin, self.map_height_px - margin)
-        else: sx = self.map_width_px + margin; sy = random.uniform(margin, self.map_height_px - margin)
+        if not self.core:
+             print("WARN: Cannot spawn enemy, core does not exist.")
+             return # Don't spawn if core is gone
+
+        # Choose spawn edge and position
+        edge = random.choice(['top', 'left', 'right'])
+        margin = TILE_SIZE * 1.5 # Spawn slightly off-screen
+        sx, sy = 0.0, 0.0
+
+        if edge == 'top':
+            sx = random.uniform(margin, self.map_width_px - margin)
+            sy = -margin
+        elif edge == 'left':
+            sx = -margin
+            sy = random.uniform(margin, self.map_height_px - margin)
+        else: # Right edge
+            sx = self.map_width_px + margin
+            sy = random.uniform(margin, self.map_height_px - margin)
+
         enemy_id = self.get_next_enemy_id()
-        core_coords = (self.core.center_x, self.core.center_y) if self.core else (self.map_width_px / 2, self.map_height_px / 2)
+        core_coords = (self.core.center_x, self.core.center_y)
+
+        # Use current_enemy_hp which is updated based on wave number
         new_enemy = Enemy(sx, sy, core_coords, self.current_enemy_hp, ENEMY_SPEED, ENEMY_DAMAGE, ENEMY_ATTACK_COOLDOWN, enemy_id)
         self.enemies[enemy_id] = new_enemy
+
+        # Broadcast new enemy (Host only)
         if self.network_mode == "host" and self.server:
              state = new_enemy.get_state()
-             if state: self.server.broadcast_message({'type': 'enemy_add', 'data': state})
+             if state:
+                 self.server.broadcast_message({'type': 'enemy_add', 'data': state})
 
     # --- Power Grid (Server/SP Only Calculation) ---
     def update_power_grid(self):
-            """Server/SP: Recalculates power distribution."""
+            """Server/SP: Recalculates power distribution across all networks."""
             if self.network_mode == "client": return
 
-            # 1. Reset Status
+            # 1. Reset Status on all potential nodes and consumers
             for node in self.power_nodes:
                 node.is_on_grid = False
-                # node.power_source_node = None # Server only internal ref
-                node.connected_nodes_coords.clear()
-                if node.is_power_storage: node.is_charging = node.is_discharging = False
+                node.connected_nodes_coords.clear() # Clear visual connection data
+                if node.is_power_storage:
+                     node.is_charging = False
+                     node.is_discharging = False
             for consumer in self.power_consumers:
                 consumer.is_powered = False
-                consumer.power_source_coords = None  # <<< Reset source coords
+                consumer.power_source_coords = None # Reset visual connection data
 
-            # 2. Network Discovery via BFS (Remains the same)
-            potential_seeds = [n for n in self.power_nodes if
-                               n.is_power_source or (n.is_power_storage and n.charge > 1e-9)]
-            processed = set();
-            networks = []
-            for seed in potential_seeds:
-                if seed in processed: continue
-                network_nodes = set();
-                visited = {seed};
-                queue = deque([(seed, 0)])
+            # 2. Network Discovery using BFS from potential sources
+            potential_seeds = [n for n in self.power_nodes if n.is_power_source or (n.is_power_storage and n.charge > 1e-9)]
+            processed_nodes = set()
+            all_networks = [] # List to store sets of nodes, each set is one independent network
+
+            for seed_node in potential_seeds:
+                if seed_node in processed_nodes:
+                    continue # Already processed as part of another network
+
+                current_network_nodes = set()
+                queue = deque([(seed_node, 0)]) # Store (node, depth)
+                visited_in_bfs = {seed_node}
+
                 while queue:
-                    curr, depth = queue.popleft()
-                    network_nodes.add(curr);
-                    curr.is_on_grid = True;
-                    processed.add(curr)
-                    if depth >= POWER_SEARCH_DEPTH_LIMIT: continue
-                    radius_grid = int(POWER_RADIUS / TILE_SIZE) + 1
-                    for dx in range(-radius_grid, radius_grid + 1):
-                        for dy in range(-radius_grid, radius_grid + 1):
+                    current_node, depth = queue.popleft()
+
+                    # Add to this network's node set and mark as processed globally
+                    current_network_nodes.add(current_node)
+                    processed_nodes.add(current_node)
+                    current_node.is_on_grid = True # Mark node as connected
+
+                    if depth >= POWER_SEARCH_DEPTH_LIMIT:
+                        continue # Stop searching deeper from this branch
+
+                    # Find neighbors within range
+                    radius_grid_search = int(POWER_RADIUS / TILE_SIZE) + 1
+                    for dx in range(-radius_grid_search, radius_grid_search + 1):
+                        for dy in range(-radius_grid_search, radius_grid_search + 1):
                             if dx == 0 and dy == 0: continue
-                            neighbor = self.get_structure_at(curr.grid_x + dx, curr.grid_y + dy)
-                            if neighbor and neighbor.is_power_node and neighbor not in visited:
-                                if distance_sq(curr.center_x, curr.center_y, neighbor.center_x,
-                                               neighbor.center_y) <= POWER_RADIUS ** 2:
-                                    visited.add(neighbor);
-                                    queue.append((neighbor, depth + 1))
-                                    curr_coords = (curr.center_x, curr.center_y);
-                                    neighbor_coords = (neighbor.center_x, neighbor.center_y)
-                                    if neighbor_coords not in curr.connected_nodes_coords: curr.connected_nodes_coords.append(
-                                        neighbor_coords)
-                                    if curr_coords not in neighbor.connected_nodes_coords: neighbor.connected_nodes_coords.append(
-                                        curr_coords)
-                if network_nodes: networks.append(network_nodes)
+
+                            check_gx, check_gy = current_node.grid_x + dx, current_node.grid_y + dy
+                            neighbor = self.get_structure_at(check_gx, check_gy)
+
+                            # Check if valid neighbor: exists, is a power node, not visited yet, and within actual distance
+                            if (neighbor and neighbor.is_power_node and
+                                    neighbor not in visited_in_bfs and
+                                    distance_sq(current_node.center_x, current_node.center_y, neighbor.center_x, neighbor.center_y) <= POWER_RADIUS ** 2):
+
+                                visited_in_bfs.add(neighbor)
+                                queue.append((neighbor, depth + 1))
+
+                                # Store visual connection coordinates (avoid duplicates)
+                                curr_coords = (current_node.center_x, current_node.center_y)
+                                neighbor_coords = (neighbor.center_x, neighbor.center_y)
+                                if neighbor_coords not in current_node.connected_nodes_coords:
+                                    current_node.connected_nodes_coords.append(neighbor_coords)
+                                if curr_coords not in neighbor.connected_nodes_coords:
+                                    neighbor.connected_nodes_coords.append(curr_coords)
+
+                if current_network_nodes: # If BFS found any nodes
+                    all_networks.append(current_network_nodes)
 
             # 3. Calculate Balance & Set Status Per Network
-            delta_time = self.dt
-            for net_nodes in networks:
-                gen_rate = sum(COALGENERATOR_POWER_OUTPUT for n in net_nodes if n.is_power_source)
-                consumers_in_net = []  # Store tuples (consumer, closest_node)
-                cons_rate = 0.0
-                for c in self.power_consumers:
-                    closest = self.find_closest_node_in_set(c, net_nodes)
-                    if closest:
-                        consumers_in_net.append((c, closest))  # Store consumer and its source node
-                        cons_rate += c.power_consumption
-                batteries = [n for n in net_nodes if n.is_power_storage]
-                discharge_rate = sum(b.discharge_rate for b in batteries if b.charge > 1e-9)
-                discharge_amount = sum(min(b.charge, b.discharge_rate * delta_time) for b in batteries)
+            delta_time = self.dt # Use frame delta time for calculations
 
-                # 4. Determine Sufficiency (Remains the same)
-                sufficient = (gen_rate + discharge_rate >= (cons_rate - 1e-9))
+            for network_nodes_set in all_networks:
+                # Calculate total generation in this network
+                total_generation_rate = sum(COALGENERATOR_POWER_OUTPUT for n in network_nodes_set if n.building_type == BUILDING_COALGENERATOR and n.is_power_source) # is_power_source set in CoalGenerator.update
+
+                # Find consumers connected to THIS network and sum their consumption
+                consumers_in_this_network = [] # Store tuples (consumer, closest_node_in_network)
+                total_consumption_rate = 0.0
+                for consumer in self.power_consumers:
+                    closest_node = self.find_closest_node_in_set(consumer, network_nodes_set)
+                    if closest_node: # If consumer is close enough to a node in this network
+                        consumers_in_this_network.append((consumer, closest_node))
+                        total_consumption_rate += consumer.power_consumption
+
+                # Calculate battery potential for this network
+                batteries_in_network = [n for n in network_nodes_set if n.is_power_storage]
+                max_possible_discharge_rate = sum(b.discharge_rate for b in batteries_in_network if b.charge > 1e-9)
+                total_available_discharge_amount = sum(min(b.charge, b.discharge_rate * delta_time) for b in batteries_in_network) # Max energy batteries can provide this frame
+                total_available_charge_room = sum(min(b.capacity - b.charge, b.charge_rate * delta_time) for b in batteries_in_network) # Max energy batteries can absorb this frame
+
+                # 4. Determine Sufficiency
+                is_power_sufficient = (total_generation_rate + max_possible_discharge_rate >= total_consumption_rate - 1e-9)
 
                 # 5/6. Set Status & Apply Charge/Discharge Amounts
-                charge_amt, discharge_amt = 0.0, 0.0
-                if sufficient:
-                    for consumer, source_node in consumers_in_net:
-                        consumer.is_powered = True
-                        consumer.power_source_coords = (source_node.center_x, source_node.center_y)  # <<< STORE COORDS
-                    balance = gen_rate - cons_rate
-                    if balance < -1e-9:
-                        discharge_amt = min(abs(balance) * delta_time, discharge_amount)
-                    elif balance > 1e-9:
-                        charge_room = sum(min(b.capacity - b.charge, b.charge_rate * delta_time) for b in batteries)
-                        charge_amt = min(balance * delta_time, charge_room)
-                else:  # Insufficient
-                    for consumer, source_node in consumers_in_net:
-                        consumer.is_powered = False
-                        consumer.power_source_coords = None  # <<< Ensure coords are None if not powered
-                    if gen_rate > 1e-9:
-                        charge_room = sum(min(b.capacity - b.charge, b.charge_rate * delta_time) for b in batteries)
-                        charge_amt = min(gen_rate * delta_time, charge_room)
+                actual_charge_amount = 0.0
+                actual_discharge_amount = 0.0
 
-                # Apply Battery Amounts (Remains the same logic)
-                if discharge_amt > 1e-9:
-                    available_discharge = sum(min(b.charge, b.discharge_rate * delta_time) for b in batteries)
-                    if available_discharge > 1e-9:
-                        fraction = min(1.0, discharge_amt / available_discharge)
-                        for b in batteries:
-                            provide = min(b.charge, b.discharge_rate * delta_time) * fraction
-                            if provide > 1e-9: b.charge -= provide; b.is_discharging = True
-                if charge_amt > 1e-9:
-                    available_room = sum(min(b.capacity - b.charge, b.charge_rate * delta_time) for b in batteries)
-                    if available_room > 1e-9:
-                        fraction = min(1.0, charge_amt / available_room)
-                        for b in batteries:
-                            absorb = min(b.capacity - b.charge, b.charge_rate * delta_time) * fraction
-                            if absorb > 1e-9: b.charge += absorb; b.is_charging = True
+                if is_power_sufficient:
+                    # Power all consumers connected to this network
+                    for consumer, source_node in consumers_in_this_network:
+                        consumer.is_powered = True
+                        consumer.power_source_coords = (source_node.center_x, source_node.center_y) # For visual line
+
+                    # Calculate net balance (positive = surplus, negative = deficit needing battery discharge)
+                    power_balance = total_generation_rate - total_consumption_rate
+
+                    if power_balance < -1e-9: # Deficit - need to discharge batteries
+                        needed_discharge_amount = abs(power_balance) * delta_time
+                        # Discharge only up to what's available
+                        actual_discharge_amount = min(needed_discharge_amount, total_available_discharge_amount)
+                    elif power_balance > 1e-9: # Surplus - can charge batteries
+                        potential_charge_amount = power_balance * delta_time
+                        # Charge only up to available room
+                        actual_charge_amount = min(potential_charge_amount, total_available_charge_room)
+
+                else: # Insufficient Power (Generation + Max Discharge < Consumption)
+                    # No consumers are powered in this scenario in this simplified model
+                    for consumer, source_node in consumers_in_this_network:
+                        consumer.is_powered = False
+                        consumer.power_source_coords = None # No power source visual
+
+                    # Batteries might still charge slightly from generation if there's room
+                    potential_charge_amount = total_generation_rate * delta_time
+                    actual_charge_amount = min(potential_charge_amount, total_available_charge_room)
+                    # No discharge happens if power is insufficient overall
+
+
+                # Apply calculated charge/discharge to batteries proportionally
+                if actual_discharge_amount > 1e-9 and total_available_discharge_amount > 1e-9:
+                    discharge_fraction = actual_discharge_amount / total_available_discharge_amount
+                    for battery in batteries_in_network:
+                        provide = min(battery.charge, battery.discharge_rate * delta_time) * discharge_fraction
+                        if provide > 1e-9:
+                            battery.charge -= provide
+                            battery.is_discharging = True # Set status for visual feedback
+                if actual_charge_amount > 1e-9 and total_available_charge_room > 1e-9:
+                     charge_fraction = actual_charge_amount / total_available_charge_room
+                     for battery in batteries_in_network:
+                         absorb = min(battery.capacity - battery.charge, battery.charge_rate * delta_time) * charge_fraction
+                         if absorb > 1e-9:
+                             battery.charge += absorb
+                             battery.is_charging = True # Set status for visual feedback
 
     def find_closest_node_in_set(self, consumer, node_set):
-        closest = None; min_d_sq = POWER_RADIUS * POWER_RADIUS
+        """Finds the closest power node in a given set to a consumer, within POWER_RADIUS."""
+        closest_node = None
+        min_dist_sq = POWER_RADIUS * POWER_RADIUS + 1 # Start slightly outside max radius
+
         for node in node_set:
             d_sq = distance_sq(consumer.center_x, consumer.center_y, node.center_x, node.center_y)
-            if d_sq <= min_d_sq and (closest is None or d_sq < min_d_sq):
-                min_d_sq = d_sq; closest = node
-        return closest
+            if d_sq <= POWER_RADIUS * POWER_RADIUS and d_sq < min_dist_sq:
+                min_dist_sq = d_sq
+                closest_node = node
+        return closest_node
 
-        # --- Tooltip Calculation ---
-
+    # --- Tooltip Calculation ---
     def calculate_network_stats(self, start_node_id):
-        """Calculates display stats for network connected to start_node_id.
-           Now attempts to calculate full network stats based on client state."""
+        """Calculates display stats for the network connected to start_node_id.
+           Uses the current (potentially client-side) game state."""
         start_node = self.get_structure_by_id(start_node_id)
+        # Check if the node exists and is marked as being on a grid (state sync'd from server)
         if start_node is None or not start_node.is_power_node or not start_node.is_on_grid:
-            self.network_stats = None  # No stats if node isn't valid or isn't on a grid
+            self.network_stats = None # No stats if node isn't valid or isn't powered
             return
 
-        stats = {'generation': 0.0, 'consumption': 0.0, 'capacity': 0.0, 'charge': 0.0, 'nodes': 0, 'net': 0.0}
-        network_node_ids = set()
+        stats = {'generation': 0.0, 'consumption': 0.0, 'capacity': 0.0, 'charge': 0.0, 'nodes': 0}
+        network_node_ids = set() # Store IDs of nodes found in this network
         queue = deque([start_node_id])
         visited_ids = {start_node_id}
 
-        # BFS using structure dictionary and synced connection data
+        # BFS using synced connection data (connected_nodes_coords)
         while queue:
             current_node_id = queue.popleft()
             current_node = self.get_structure_by_id(current_node_id)
-            # Ensure node exists and is actually on the grid according to its state
+
+            # Node must exist and be on the grid according to its state
             if current_node is None or not current_node.is_power_node or not current_node.is_on_grid:
                 continue
 
@@ -1769,51 +2021,47 @@ class Game:
             stats['nodes'] += 1
 
             # Sum stats based on node type and state
-            if current_node.building_type == BUILDING_COALGENERATOR and current_node.is_power_source:
+            # Note: is_power_source for generator and charge for battery are synced from server state
+            if current_node.building_type == BUILDING_COALGENERATOR and getattr(current_node, 'is_power_source', False):
                 stats['generation'] += COALGENERATOR_POWER_OUTPUT
             if current_node.is_power_storage:
-                stats['capacity'] += current_node.capacity
-                stats['charge'] += current_node.charge
+                stats['capacity'] += getattr(current_node, 'capacity', 0)
+                stats['charge'] += getattr(current_node, 'charge', 0)
 
             # Explore neighbors using connected_nodes_coords
-            # We need to find the structure objects corresponding to these coords to continue BFS
-            for neighbor_coords in current_node.connected_nodes_coords:
-                # This is inefficient: Check all structures to find one matching the coords.
-                # A spatial hash or mapping coords to IDs would be faster.
+            # This requires finding node IDs corresponding to the coordinates
+            for neighbor_coords in getattr(current_node, 'connected_nodes_coords', []):
                 found_neighbor_id = None
-                for potential_neighbor_id, potential_neighbor in self.structures.items():
-                    if (potential_neighbor.is_power_node and
-                            abs(potential_neighbor.center_x - neighbor_coords[0]) < 1.0 and
-                            abs(potential_neighbor.center_y - neighbor_coords[1]) < 1.0):
-                        # Found a match (approximate float comparison)
-                        if potential_neighbor_id not in visited_ids:
-                            found_neighbor_id = potential_neighbor_id
-                            break  # Found the neighbor matching coords
+                # Inefficient search for neighbor matching coords - OK for tooltip?
+                for potential_id, potential_node in self.structures.items():
+                    if (potential_node.is_power_node and potential_id not in visited_ids and
+                            abs(potential_node.center_x - neighbor_coords[0]) < 1.0 and
+                            abs(potential_node.center_y - neighbor_coords[1]) < 1.0):
+                        found_neighbor_id = potential_id
+                        break # Found the neighbor
 
                 if found_neighbor_id:
                     visited_ids.add(found_neighbor_id)
                     queue.append(found_neighbor_id)
 
-        # Now, find consumers potentially connected to this network
-        # Check all consumers in the game state
+        # Now, find consumers potentially powered by this network
+        # Check all consumers whose state indicates they are powered AND their source coords match a node in our found network
         for consumer in self.structures.values():
-            if consumer.is_power_consumer and consumer.is_powered:
-                # Check if this consumer's power source is within the discovered network
-                source_coords = getattr(consumer, 'power_source_coords', None)
-                if source_coords:
-                    # Check if any node in our found network matches the source coords
-                    for node_id in network_node_ids:
-                        node = self.structures.get(node_id)
-                        if node and abs(node.center_x - source_coords[0]) < 1.0 and abs(
-                                node.center_y - source_coords[1]) < 1.0:
-                            stats['consumption'] += consumer.power_consumption
-                            break  # Found the source node in this network, count consumption once
+             # Check consumer status based on its synced state
+             if consumer.is_power_consumer and getattr(consumer, 'is_powered', False):
+                 source_coords = getattr(consumer, 'power_source_coords', None)
+                 if source_coords:
+                     # Check if the source coords match any node in the network we just BFS'd
+                     for node_id in network_node_ids:
+                         node = self.structures.get(node_id)
+                         if node and abs(node.center_x - source_coords[0]) < 1.0 and abs(node.center_y - source_coords[1]) < 1.0:
+                             # Found the source node within this network, count the consumption
+                             stats['consumption'] += consumer.power_consumption
+                             break # Count consumption only once per consumer
 
-        stats['net'] = stats['generation'] - stats['consumption']
-        self.network_stats = stats  # Set the calculated stats
+        self.network_stats = stats # Store calculated stats
 
     # --- Input Handling ---
-    # (handle_events remains the same)
     def handle_events(self, events):
         """Handles player input, UI interaction, and music controls."""
         local_player = self.players.get(self.local_player_id)
@@ -1821,15 +2069,15 @@ class Game:
         # --- Update Local Player Movement Intent (Sent Separately if Client) ---
         keys = pygame.key.get_pressed()
         my, mx = (keys[pygame.K_s] - keys[pygame.K_w]), (keys[pygame.K_d] - keys[pygame.K_a])
-        payload = None
+        move_payload = None # Renamed to avoid clash
         direction_changed = False
         if local_player:
             if local_player.move_x != mx or local_player.move_y != my:
                 direction_changed = True
                 local_player.move_x, local_player.move_y = mx, my
-                payload = {'action': 'move', 'data': {'x': mx, 'y': my}}
-        if self.network_mode == "client" and self.client and payload and direction_changed:
-            self.client.send_message({'type': 'input', 'payload': payload})
+                move_payload = {'action': 'move', 'data': {'x': mx, 'y': my}}
+        if self.network_mode == "client" and self.client and move_payload and direction_changed:
+            self.client.send_message({'type': 'input', 'payload': move_payload})
         # --- End Movement ---
 
         mouse_pos = pygame.mouse.get_pos()
@@ -1844,7 +2092,7 @@ class Game:
                 new_hover_id = struct.network_id
         if new_hover_id != self.hovered_power_node_id:
             self.hovered_power_node_id = new_hover_id
-            self.network_stats = None
+            self.network_stats = None # Reset stats when hover changes
             self.network_stats_timer = 0
         # --- End Tooltip ---
 
@@ -1856,8 +2104,8 @@ class Game:
             # -------------------------------------------------------
 
             if event.type == pygame.QUIT:
-                self.running = False
-                continue # Go to next event or exit loop
+                self.running = False # Signal main loop to exit app
+                continue # Skip rest of processing for this event
 
             # --- Handle Mouse Button Down ---
             if event.type == pygame.MOUSEBUTTONDOWN:
@@ -1867,13 +2115,12 @@ class Game:
                         self.dragging_volume = True
                         slider_interacted = True
                     elif self.volume_slider_track_rect and self.volume_slider_track_rect.collidepoint(mouse_pos):
-                        # Clicked on track -> set volume directly
                         relative_x = mouse_pos[0] - self.volume_slider_track_rect.left
-                        self.current_volume = max(0.0, min(1.0, relative_x / self.volume_slider_track_rect.width))
-                        try:
-                            pygame.mixer.music.set_volume(self.current_volume)
-                        except pygame.error as e: print(f"WARN: Set volume error: {e}")
-                        # Update handle position immediately
+                        new_volume = max(0.0, min(1.0, relative_x / self.volume_slider_track_rect.width))
+                        if abs(new_volume - self.current_volume) > 1e-3: # Update only if changed significantly
+                             self.current_volume = new_volume
+                             try: pygame.mixer.music.set_volume(self.current_volume)
+                             except pygame.error as e: print(f"WARN: Set volume error: {e}")
                         self.volume_slider_handle_rect.centerx = self.volume_slider_track_rect.left + int(self.current_volume * self.volume_slider_track_rect.width)
                         slider_interacted = True
                 # --------------------------------------------
@@ -1881,22 +2128,18 @@ class Game:
                 # --- Music Buttons Click ---
                 if event.button == 1 and not slider_interacted and self.game_music_files:
                      if self.prev_button_rect and self.prev_button_rect.collidepoint(mouse_pos):
-                         self.play_prev_song()
-                         button_interacted = True
+                         self.play_prev_song(); button_interacted = True
                      elif self.play_pause_button_rect and self.play_pause_button_rect.collidepoint(mouse_pos):
-                         self.toggle_pause()
-                         button_interacted = True
+                         self.toggle_pause(); button_interacted = True
                      elif self.next_button_rect and self.next_button_rect.collidepoint(mouse_pos):
-                         self.play_next_song()
-                         button_interacted = True
+                         self.play_next_song(); button_interacted = True
                 # -------------------------
 
                 # --- Game Action Click (Build/Delete) ---
-                # Only process if NO music UI was clicked during THIS mouse down event
                 if not slider_interacted and not button_interacted:
+                    # Only process game actions if UI wasn't clicked and game not over/won
                     if not self.game_over and not self.game_won and not mouse_over_ui:
                         game_action_payload = None
-                        # Access event.button HERE, only when type is MOUSEBUTTONDOWN and UI wasn't clicked
                         if event.button == 1 and self.selected_building_type != BUILDING_NONE:
                             game_action_payload = {'action': 'place', 'data': {'type': self.selected_building_type, 'gx': mouse_gx, 'gy': mouse_gy, 'orient': self.selected_orientation}}
                         elif event.button == 3: # Right Click for Delete
@@ -1906,64 +2149,59 @@ class Game:
                         if game_action_payload:
                             if self.network_mode == "client" and self.client:
                                 self.client.send_message({'type': 'input', 'payload': game_action_payload})
-                            elif self.network_mode != "client": # Server or SP
+                            elif self.network_mode != "client": # Server or SP executes directly
                                 action_type, data = game_action_payload['action'], game_action_payload['data']
-                                if action_type == 'place':
-                                    self.action_place_structure(self.local_player_id, data['type'], data['gx'], data['gy'], data['orient'])
-                                elif action_type == 'remove':
-                                    self.action_remove_structure(self.local_player_id, data['gx'], data['gy'])
+                                if action_type == 'place': self.action_place_structure(self.local_player_id, data['type'], data['gx'], data['gy'], data['orient'])
+                                elif action_type == 'remove': self.action_remove_structure(self.local_player_id, data['gx'], data['gy'])
                 # ---------------------------------------
 
             # --- Handle Mouse Button Up ---
             elif event.type == pygame.MOUSEBUTTONUP:
                 if event.button == 1 and self.dragging_volume:
                     self.dragging_volume = False
-                    slider_interacted = True # Treat mouse up after drag as UI interaction for this event cycle
+                    # slider_interacted = True # Mouse up after drag isn't really an interaction needing to block others
             # ---------------------------
 
             # --- Handle Mouse Motion ---
             elif event.type == pygame.MOUSEMOTION:
                 if self.dragging_volume:
-                    # Update volume and handle position based on drag
                     clamped_x = max(self.volume_slider_track_rect.left, min(mouse_pos[0], self.volume_slider_track_rect.right))
                     relative_x = clamped_x - self.volume_slider_track_rect.left
-                    self.current_volume = relative_x / self.volume_slider_track_rect.width
-                    try:
-                         pygame.mixer.music.set_volume(self.current_volume)
-                    except pygame.error as e: print(f"WARN: Set volume error: {e}")
+                    new_volume = relative_x / self.volume_slider_track_rect.width
+                    # Update volume only if dragging and value changed
+                    if abs(new_volume - self.current_volume) > 1e-3:
+                         self.current_volume = new_volume
+                         try: pygame.mixer.music.set_volume(self.current_volume)
+                         except pygame.error as e: print(f"WARN: Set volume error: {e}")
                     self.volume_slider_handle_rect.centerx = clamped_x
-                    slider_interacted = True # Treat dragging motion as UI interaction
+                    # slider_interacted = True # Dragging doesn't need to block other events like key presses
             # --------------------------
 
             # --- Handle Key Down ---
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
-                    self.running = False # Signal to main loop to exit game state
-                    continue # Skip other key handling for this frame
+                    self.running = False # Signal to main loop to exit game state/menu
+                    continue # Don't process other keys if ESC pressed
 
-                if self.game_over or self.game_won:
-                    continue # Ignore game keys if game ended
+                # Ignore game keys if game ended
+                if self.game_over or self.game_won: continue
 
                 key = event.key
                 key_action_payload = None
 
                 # Building Selection / Deselection / Rotation
-                if key == pygame.K_0:
-                    self.selected_building_type = BUILDING_NONE
+                if key == pygame.K_0: self.selected_building_type = BUILDING_NONE
                 elif key == pygame.K_r and self.selected_building_type == BUILDING_CONVEYOR:
                     self.selected_orientation = (self.selected_orientation + 1) % 4
-                    # Update preview instance if it exists
                     preview = self.preview_instances.get(BUILDING_CONVEYOR)
                     if preview: preview.orientation = self.selected_orientation
                 elif key in self.key_to_building_type:
                     selected = self.key_to_building_type[key]
                     if self.selected_building_type != selected:
-                        self.selected_building_type = selected
-                        self.selected_orientation = EAST # Reset orientation for non-conveyors
+                        self.selected_building_type = selected; self.selected_orientation = EAST
 
                 # Upgrade Action
                 elif key == pygame.K_u and self.selected_building_type == BUILDING_NONE and not mouse_over_ui:
-                    # Check if mouse is over a valid building for upgrade
                     struct_to_upgrade = self.get_structure_at(mouse_gx, mouse_gy)
                     if struct_to_upgrade and struct_to_upgrade.building_type != BUILDING_RESOURCE:
                          key_action_payload = {'action': 'upgrade', 'data': {'gx': mouse_gx, 'gy': mouse_gy}}
@@ -1972,16 +2210,485 @@ class Game:
                 if key_action_payload:
                     if self.network_mode == "client" and self.client:
                         self.client.send_message({'type': 'input', 'payload': key_action_payload})
-                    elif self.network_mode != "client": # Server or SP
+                    elif self.network_mode != "client": # Server or SP executes directly
                          if key_action_payload['action'] == 'upgrade':
                              self.action_upgrade_structure(self.local_player_id, **key_action_payload['data'])
+            # ----------------------
+
+            # --- End of event processing for this specific event ---
+        # --- End of Event Queue Processing for this frame ---
+
+    # --- Update Logic ---
+    def update(self):
+        """Updates the game state for one frame."""
+        if not self.running: return # Should not be called if not running, but safety check
+
+        # --- Server / Single Player Update Logic ---
+        if self.network_mode in ["host", "sp"]:
+            # Update Players
+            for player in self.players.values():
+                player.update(self.dt, self) # Pass self for map bounds
+
+            # Update Structures
+            # Iterate over list copy in case structures are added/removed during update
+            for struct in list(self.structures.values()):
+                struct.update(self) # Includes drills, generators, turrets finding targets, etc.
+
+            # Update Enemies
+            for enemy in list(self.enemies.values()):
+                enemy.update(self) # Movement, targeting, attacking
+
+            # Update Projectiles
+            for proj in list(self.projectiles.values()):
+                proj.update(self) # Movement, collision check
+
+            # Update Power Grid periodically
+            self.power_grid_update_timer += self.dt
+            if self.power_grid_update_timer >= self.power_grid_update_interval:
+                self.power_grid_update_timer = 0.0 # Reset timer
+                self.update_power_grid()
+
+            # --- Cleanup Destroyed Entities ---
+            destroyed_structure_ids = [sid for sid, s in self.structures.items() if s.destroyed]
+            core_destroyed_this_frame = False
+            for sid in destroyed_structure_ids:
+                 if sid in self.structures: # Check if not already removed
+                     if self.structures[sid].building_type == BUILDING_CORE:
+                         core_destroyed_this_frame = True
+                     self._remove_structure_from_game(self.structures[sid])
+
+            destroyed_enemy_ids = [eid for eid, e in self.enemies.items() if e.destroyed]
+            for eid in destroyed_enemy_ids:
+                 if eid in self.enemies: del self.enemies[eid] # Remove from dict
+
+            destroyed_projectile_ids = [pid for pid, p in self.projectiles.items() if p.destroyed]
+            for pid in destroyed_projectile_ids:
+                 if pid in self.projectiles: del self.projectiles[pid] # Remove from dict
+
+            # Broadcast removals if host
+            if self.network_mode == "host" and self.server:
+                 if destroyed_structure_ids: self.server.broadcast_message({'type': 'structures_remove', 'ids': destroyed_structure_ids})
+                 if destroyed_enemy_ids: self.server.broadcast_message({'type': 'enemies_remove', 'ids': destroyed_enemy_ids})
+                 if destroyed_projectile_ids: self.server.broadcast_message({'type': 'projectiles_remove', 'ids': destroyed_projectile_ids})
+            # --- End Cleanup ---
+
+
+            # --- Wave Management ---
+            if not self.game_over and not self.game_won: # Only manage waves if game is active
+                self.wave_timer -= self.dt
+
+                # Start new wave if cooldown finished
+                if not self.in_wave and self.wave_timer <= 0 and self.wave_number < self.max_waves:
+                    self.in_wave = True
+                    self.wave_number += 1
+                    self.enemies_to_spawn_this_wave = 10 + self.wave_number * 5 # Example scaling
+                    self.enemies_spawned_this_wave = 0
+                    self.current_enemy_hp = ENEMY_START_HP + (self.wave_number - 1) * ENEMY_HP_INCREASE_PER_WAVE
+                    self.wave_timer = WAVE_DURATION # Set timer for wave duration
+                    self.enemy_spawn_timer = 0 # Reset spawn timer for the new wave
+                    print(f"SERVER/SP: --- Wave {self.wave_number}/{self.max_waves} Started (HP: {self.current_enemy_hp}) ---")
+                    # Broadcast wave update if host
+                    if self.network_mode == "host" and self.server:
+                         self.server.broadcast_message({'type': 'wave_update', 'data': {'number': self.wave_number, 'timer': self.wave_timer, 'in_wave': self.in_wave}})
+
+
+                # Spawn enemies during a wave
+                if self.in_wave and self.enemies_spawned_this_wave < self.enemies_to_spawn_this_wave:
+                    self.enemy_spawn_timer -= self.dt
+                    if self.enemy_spawn_timer <= 0:
+                        self.spawn_enemy()
+                        self.enemies_spawned_this_wave += 1
+                        # Calculate next spawn time (distribute over wave duration with some randomness)
+                        base_interval = WAVE_DURATION / self.enemies_to_spawn_this_wave if self.enemies_to_spawn_this_wave > 0 else ENEMY_SPAWN_RATE
+                        self.enemy_spawn_timer = max(0.1, base_interval * random.uniform(0.7, 1.3)) # Add jitter, ensure minimum delay
+
+                # End wave conditions
+                wave_ended_naturally = self.in_wave and self.wave_timer <= 0
+                wave_cleared = self.in_wave and self.enemies_spawned_this_wave >= self.enemies_to_spawn_this_wave and not self.enemies
+
+                if wave_ended_naturally or wave_cleared:
+                    result = 'Cleared' if not self.enemies else 'Ended'
+                    print(f"SERVER/SP: --- Wave {self.wave_number} {result} ---")
+                    self.in_wave = False
+                    self.wave_timer = WAVE_COOLDOWN # Start cooldown for next wave
+                     # Broadcast wave update if host
+                    if self.network_mode == "host" and self.server:
+                         self.server.broadcast_message({'type': 'wave_update', 'data': {'number': self.wave_number, 'timer': self.wave_timer, 'in_wave': self.in_wave}})
+
+            # --- Game End Conditions ---
+            if core_destroyed_this_frame and not self.game_over:
+                self.game_over = True
+                print("SERVER/SP: --- GAME OVER --- Core Destroyed!")
+                # Broadcast game status if host
+                if self.network_mode == "host" and self.server:
+                    self.server.broadcast_message({'type': 'game_status', 'status': 'over'})
+
+            # Check win condition (only if not already won/lost)
+            if not self.game_over and not self.game_won:
+                if self.wave_number >= self.max_waves and not self.in_wave and not self.enemies:
+                     self.game_won = True
+                     print("SERVER/SP: --- YOU WIN! --- All waves survived!")
+                     # Broadcast game status if host
+                     if self.network_mode == "host" and self.server:
+                          self.server.broadcast_message({'type': 'game_status', 'status': 'won'})
+            # --- End Game End ---
+
+        # --- Client Update Logic ---
+        elif self.network_mode == "client":
+            # Clients mainly rely on server state updates (apply_full_snapshot / apply_incremental_update)
+            # Client-side updates are mostly for visual smoothing / prediction / local effects
+
+            # Update structure animations (e.g., conveyor item movement) based on last known state
+            for struct in self.structures.values():
+                struct.client_update(self.dt) # Handles item progress on conveyors visually
+
+            # Update projectile positions visually based on last known velocity
+            for proj in self.projectiles.values():
+                proj.client_update(self.dt) # Simple linear movement
+
+            # Update local player visual position (can add prediction/interpolation later)
+            local_player = self.players.get(self.local_player_id)
+            if local_player:
+                local_player.update(self.dt, self) # Update visual pos using self for bounds
+
+            # Update network stats tooltip calculation timer
+            if self.hovered_power_node_id:
+                self.network_stats_timer += self.dt
+                if self.network_stats is None or self.network_stats_timer >= POWER_NETWORK_STATS_UPDATE_INTERVAL:
+                    self.network_stats_timer = 0
+                    self.calculate_network_stats(self.hovered_power_node_id)
+            else:
+                 self.network_stats = None # Clear stats if not hovering
+
+        # --- End Client Update ---
+
+    # --- Drawing Logic ---
+    def draw_grid(self):
+        """Draws the background grid lines."""
+        map_end_y = self.map_height_px
+        grid_line_color = (60, 60, 60)
+        current_w = self.screen.get_width()
+        # Vertical lines
+        for x in range(0, current_w, TILE_SIZE):
+            pygame.draw.line(self.screen, grid_line_color, (x, 0), (x, map_end_y), 1)
+        # Horizontal lines
+        for y in range(0, int(map_end_y) + 1, TILE_SIZE):
+            pygame.draw.line(self.screen, grid_line_color, (0, y), (current_w, y), 1)
+
+    def draw_base_terrain(self):
+        """Draws the resource patches on the ground."""
+        for (gx, gy), res_type in self.base_terrain.items():
+             # Draw background color of the patch
+             color = COLOR_COPPER if res_type == RES_COPPER else COLOR_COAL
+             world_x, world_y = grid_to_world(gx, gy)
+             rect = pygame.Rect(world_x, world_y, TILE_SIZE, TILE_SIZE)
+             pygame.draw.rect(self.screen, color, rect)
+             pygame.draw.rect(self.screen, COLOR_BLACK, rect, 1) # Border
+
+             # Draw small indicator circle in the center
+             indicator_color = COLOR_BLACK if res_type == RES_COAL else COLOR_DARK_GRAY
+             cx, cy = grid_to_world_center(gx, gy)
+             pygame.draw.circle(self.screen, indicator_color, (int(cx), int(cy)), TILE_SIZE // 5, 2)
+
+    def draw_power_grid_connections(self):
+        """Draws power lines between connected nodes and from sources to consumers."""
+        drawn_connections = set() # Prevents drawing lines twice between nodes
+        line_color = COLOR_POWER_LINE
+
+        # 1. Draw connections between connected power NODES based on their synced state
+        for struct in self.structures.values():
+            # Node must exist, be a node, and be marked as on_grid in its state
+            if struct.is_power_node and getattr(struct, 'is_on_grid', False):
+                node_center_int = (int(struct.center_x), int(struct.center_y))
+                # Use the synced coordinates list to draw lines
+                for neighbor_coords in getattr(struct, 'connected_nodes_coords', []):
+                    neighbor_center_int = (int(neighbor_coords[0]), int(neighbor_coords[1]))
+                    # Create sorted tuple key to avoid duplicates (A->B vs B->A)
+                    connection_key = tuple(sorted((node_center_int, neighbor_center_int)))
+                    if connection_key not in drawn_connections:
+                        pygame.draw.line(self.screen, line_color, node_center_int, neighbor_center_int, 1)
+                        drawn_connections.add(connection_key)
+
+        # 2. Draw connections from source nodes to *OPERATIONAL* consumers based on state
+        for struct in self.structures.values():
+             # Consumer must exist, be a consumer, be powered, AND have source coords synced
+             if (struct.is_power_consumer and
+                     getattr(struct, 'is_powered', False) and
+                     hasattr(struct, 'power_source_coords') and
+                     struct.power_source_coords): # Ensure coords are not None
+
+                 source_coords = struct.power_source_coords
+                 source_center_int = (int(source_coords[0]), int(source_coords[1]))
+                 consumer_center_int = (int(struct.center_x), int(struct.center_y))
+                 # Draw the line from the synced source coords to the consumer center
+                 pygame.draw.line(self.screen, line_color, source_center_int, consumer_center_int, 1)
+
+    def draw_build_preview(self):
+        """Draws the ghost image of the selected building under the cursor."""
+        if self.selected_building_type == BUILDING_NONE: return
+        local_player = self.players.get(self.local_player_id)
+        if not local_player: return # Need player for radius check
+
+        info = self.building_info.get(self.selected_building_type)
+        preview_instance = self.preview_instances.get(self.selected_building_type)
+        if info is None or preview_instance is None: return
+
+        mx, my = pygame.mouse.get_pos()
+        # Don't draw preview if mouse is over the UI area
+        if my >= self.map_height_px: return
+
+        gx, gy = world_to_grid(mx, my)
+        # Ensure preview stays within grid bounds visually
+        if not (0 <= gx < self.grid_width and 0 <= gy < self.grid_height): return
+
+        world_x, world_y = grid_to_world(gx, gy)
+
+        # --- Check Placement Validity ---
+        cost = info['cost']
+        can_afford = all(self.resources.get(res, 0) >= amount for res, amount in cost.items())
+
+        existing = self.get_structure_at(gx, gy)
+        BuildingClass = info['class']
+        is_drill_on_patch = (BuildingClass == Drill and isinstance(existing, ResourcePatch))
+        is_empty = (existing is None)
+        valid_tile = (is_drill_on_patch or (is_empty and BuildingClass != Drill))
+
+        target_center_x, target_center_y = grid_to_world_center(gx, gy)
+        radius_sq = PLAYER_BUILD_RADIUS * PLAYER_BUILD_RADIUS
+        in_radius = distance_sq(local_player.world_x, local_player.world_y, target_center_x, target_center_y) <= radius_sq
+
+        is_placement_valid = can_afford and valid_tile and in_radius
+        # --- End Validity Check ---
+
+
+        # --- Determine Tint and Alpha ---
+        tint_color = None
+        preview_alpha = 180 # Semi-transparent default
+
+        if not is_placement_valid:
+            preview_alpha = 150 # More transparent if invalid
+            if not in_radius: tint_color = COLOR_INVALID_RADIUS # Blue tint for out of range
+            elif not valid_tile: tint_color = (*COLOR_RED[:3], 120) # Red tint for blocked tile
+            else: tint_color = (*COLOR_YELLOW[:3], 120) # Yellow tint for cannot afford
+        # --- End Tint/Alpha ---
+
+        # --- Draw Preview ---
+        try:
+            # Create a surface for the preview instance
+            preview_surf = pygame.Surface((TILE_SIZE, TILE_SIZE), pygame.SRCALPHA)
+            # Set world position to 0,0 for drawing on the surface
+            preview_instance.world_x, preview_instance.world_y = 0, 0
+            preview_instance.center_x, preview_instance.center_y = TILE_SIZE / 2.0, TILE_SIZE / 2.0
+            # Update orientation if it's a conveyor
+            if isinstance(preview_instance, Conveyor):
+                 preview_instance.orientation = self.selected_orientation
+            # Draw the building onto the temporary surface
+            preview_instance.draw(preview_surf)
+            preview_surf.set_alpha(preview_alpha)
+
+            # Apply tint if needed
+            if tint_color:
+                tint_surface = pygame.Surface((TILE_SIZE, TILE_SIZE), pygame.SRCALPHA)
+                tint_surface.fill(tint_color)
+                # Blend the tint color multiplicatively onto the preview surface
+                preview_surf.blit(tint_surface, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+
+            # Blit the final preview surface onto the main screen
+            self.screen.blit(preview_surf, (world_x, world_y))
+        except Exception as e:
+             print(f"ERROR drawing build preview for {info['name']}: {e}")
+        # --- End Draw Preview ---
+
+    def draw_ui(self):
+        """Draws the main user interface at the bottom."""
+        current_w, current_h = self.screen.get_width(), self.screen.get_height()
+        ui_rect = pygame.Rect(0, self.map_height_px, current_w, UI_HEIGHT) # Position below game area
+
+        # Background and Top Border
+        pygame.draw.rect(self.screen, COLOR_UI_BG, ui_rect)
+        pygame.draw.line(self.screen, COLOR_GRAY, (0, ui_rect.y), (current_w, ui_rect.y), 1)
+
+        # Check if fonts are loaded
+        if not all([font_tiny, font_small, font_medium]):
+            print("WARN: UI Fonts not loaded, skipping UI draw.")
+            return
+
+        # --- UI Elements ---
+        res_fs, core_fs, wave_fs = 24, 24, 24
+        build_h_fs, build_i_fs, tt_fs = 16, 16, 14
+        padding = 15
+        y_row1 = ui_rect.y + 8
+
+        # Resources
+        draw_text(self.screen, f"Cu: {self.resources.get(RES_COPPER, 0)}", res_fs, padding, y_row1, COLOR_COPPER)
+        draw_text(self.screen, f"Coal: {self.resources.get(RES_COAL, 0)}", res_fs, padding + 120, y_row1, COLOR_COAL)
+
+        # Core HP
+        core_hp_text, core_hp_color = "Core: N/A", COLOR_GRAY
+        if self.core:
+             hp = int(self.core.hp); max_hp = self.core.max_hp
+             if hp <= 0: core_hp_text, core_hp_color = "Core: DESTROYED", COLOR_RED
+             else:
+                 core_hp_text = f"Core: {hp}/{max_hp}"
+                 core_hp_color = COLOR_GREEN if hp > max_hp * 0.3 else COLOR_YELLOW
+        draw_text(self.screen, core_hp_text, core_fs, padding + 260, y_row1, core_hp_color)
+
+        # Wave Status
+        wave_text, wave_color = "", COLOR_YELLOW
+        if self.game_won: wave_text, wave_color = "YOU WIN!", COLOR_GREEN
+        elif self.game_over: wave_text, wave_color = "GAME OVER", COLOR_RED
+        elif self.in_wave:
+             num_enemies = len(self.enemies) # Number of active enemies
+             wave_text = f"Wave: {self.wave_number}/{self.max_waves} ({num_enemies} Enemies)"
+             wave_color = COLOR_RED
+        elif self.wave_number >= self.max_waves:
+             wave_text = "Clear remaining enemies!" # After last wave starts cooldown
+        else: # Cooldown between waves
+             wave_text = f"Next Wave ({self.wave_number + 1}) in: {int(self.wave_timer)}s"
+        # Position wave text further right
+        draw_text(self.screen, wave_text, wave_fs, padding + 480, y_row1, wave_color, align="topleft")
+
+
+        # Network Mode / Player Count (Top Right of UI)
+        mode_text = f"Mode: {self.network_mode.upper()}"
+        if self.network_mode == "host":
+             mode_text += f" ({len(self.players)}/{MAX_PLAYERS})"
+        elif self.network_mode == "client":
+             status = "Connected" if self.client and self.client.connected else "Connecting..."
+             mode_text += f" ({status})"
+        draw_text(self.screen, mode_text, 16, current_w - padding, y_row1 + 25, COLOR_NETWORK_STATUS, align="topright")
+
+        # Basic Controls Hint (Top Right of UI)
+        controls_text = "[WASD]Move [RMB]Del [U]Upgr [ESC]Menu"
+        draw_text(self.screen, controls_text, tt_fs, current_w - padding, y_row1 + 5, COLOR_GRAY, align="topright")
+
+
+        # --- Build Menu ---
+        y_build_start = ui_rect.y + 45 # Start lower down
+        sections = {'Production': [], 'Logistics': [], 'Defense': [], 'Power': [], 'Support': []}
+        # Group buildings by section
+        for bt, info in self.building_info.items():
+            sections.setdefault(info.get('section', 'Other'), []).append(bt)
+
+        current_build_x = padding
+        section_spacing = 15
+        item_spacing = 10
+        item_y_offset = 20 # Space below section header
+
+        # Inverse map for getting key number
+        key_num_map = {v: k for k, v in self.key_to_building_type.items()}
+
+        for section_name, building_types in sections.items():
+            if not building_types: continue # Skip empty sections
+
+            header_y = y_build_start
+            draw_text(self.screen, section_name, build_h_fs, current_build_x, header_y, COLOR_UI_HEADER)
+            header_width_approx = len(section_name) * 8 # Estimate width
+
+            item_y = header_y + item_y_offset
+            section_start_x = current_build_x
+
+            for bt in building_types:
+                info = self.building_info[bt]
+                # Format cost string (e.g., "15C+5Co")
+                cost_str = "+".join([f"{a}{'C' if r == RES_COPPER else 'Co'}" for r, a in info['cost'].items()])
+                # Get key number (1-8)
+                key_code = key_num_map.get(bt, 0)
+                key_display = str(key_code - pygame.K_0) if key_code >= pygame.K_1 else '?'
+
+                button_text = f"[{key_display}] {info['name']} ({cost_str})"
+
+                is_selected = (self.selected_building_type == bt)
+                can_afford = all(self.resources.get(res, 0) >= amount for res, amount in info['cost'].items())
+
+                # Determine text color based on selection and affordability
+                text_color = COLOR_GREEN if is_selected else COLOR_UI_TEXT
+                if not can_afford:
+                    # Dim color if cannot afford
+                    text_color = tuple(c // 2 for c in text_color)
+
+                # Render and draw text, get width for positioning next item
+                text_surface = font_small.render(button_text, True, text_color)
+                self.screen.blit(text_surface, (current_build_x, item_y))
+                current_build_x += text_surface.get_width() + item_spacing
+
+            # Move to next section position, ensure enough space
+            current_build_x = max(current_build_x, section_start_x + header_width_approx) + section_spacing
+
+        # Draw "[0] None" button
+        none_color = COLOR_GREEN if self.selected_building_type == BUILDING_NONE else COLOR_UI_TEXT
+        draw_text(self.screen, "[0] None", build_i_fs, current_build_x, y_build_start + item_y_offset, none_color)
+        # --- End Build Menu ---
+
+
+        # --- Power Network Tooltip ---
+        # Check if hovering a node AND network stats have been calculated
+        if self.hovered_power_node_id and self.network_stats:
+            hovered_node = self.get_structure_by_id(self.hovered_power_node_id)
+            # Double check the hovered node still exists and is valid (based on current state)
+            if hovered_node and hovered_node.is_power_node and getattr(hovered_node, 'is_on_grid', False):
+                stats = self.network_stats
+                mouse_x, mouse_y = pygame.mouse.get_pos()
+                box_x, box_y = mouse_x + 15, mouse_y + 10
+                line_height = 18
+                num_lines = 4 # Reduced number of lines
+                box_width = 180 # Adjusted width
+                box_height = num_lines * line_height + 10
+
+                # Adjust position to stay fully on screen
+                if box_x + box_width > current_w: box_x = mouse_x - box_width - 15 # Flip left
+                if box_y + box_height > self.map_height_px: box_y = mouse_y - box_height - 10 # Flip above cursor if near UI
+                box_y = max(5, box_y) # Prevent going off top
+
+                # Draw tooltip box
+                tooltip_bg_color = (*COLOR_UI_BG[:3], 230) # Semi-transparent background
+                pygame.draw.rect(self.screen, tooltip_bg_color, (box_x, box_y, box_width, box_height))
+                pygame.draw.rect(self.screen, COLOR_GRAY, (box_x, box_y, box_width, box_height), 1) # Border
+
+                # Draw tooltip text
+                y_offset = box_y + 5
+                net_power = stats['generation'] - stats['consumption']
+                net_power_color = COLOR_GREEN if net_power >= -1e-6 else COLOR_RED
+
+                draw_text(self.screen, f"Network ({stats['nodes']} nodes):", tt_fs, box_x + 5, y_offset, COLOR_WHITE); y_offset += line_height
+                draw_text(self.screen, f"+ {stats['generation']:.1f}/s", tt_fs, box_x + 5, y_offset, COLOR_GREEN); y_offset += line_height
+                draw_text(self.screen, f"- {stats['consumption']:.1f}/s", tt_fs, box_x + 5, y_offset, COLOR_RED); y_offset += line_height
+                storage_text = f"Bat: {stats['charge']:.0f} / {stats['capacity']:.0f}"
+                draw_text(self.screen, storage_text, tt_fs, box_x + 5, y_offset, COLOR_BATTERY_CHARGE); y_offset += line_height
+                # draw_text(self.screen, f"Net: {net_power:+.1f}/s", tt_fs, box_x + 5, y_offset, net_power_color); y_offset += line_height # Optionally show net
+
+    def draw_overlay_screen(self, title, title_color, subtitle, subtitle_color, waves_survived=None):
+        """Draws a semi-transparent overlay for game over/win screens."""
+        overlay_color = (*COLOR_DARK_GRAY[:3], 220) # Dark semi-transparent
+        current_w, current_h = self.screen.get_width(), self.screen.get_height()
+
+        # Create a surface for the overlay
+        overlay_surface = pygame.Surface((current_w, current_h), pygame.SRCALPHA)
+        overlay_surface.fill(overlay_color)
+        # Blit the overlay surface onto the main screen
+        self.screen.blit(overlay_surface, (0, 0))
+
+        # Draw text on top of the overlay
+        if font_large and font_medium and font_small:
+            center_x, center_y = current_w // 2, current_h // 2
+            # Main Title (Game Over / You Win)
+            draw_text(self.screen, title, 72, center_x, center_y - 60, title_color, align="center")
+            # Subtitle (Reason / Wave count)
+            draw_text(self.screen, subtitle, 24, center_x, center_y + 10, subtitle_color, align="center")
+            # Optional wave survival count
+            if waves_survived is not None:
+                wave_report = f"Survived {max(0, waves_survived)} waves."
+                draw_text(self.screen, wave_report, 18, center_x, center_y + 45, COLOR_GRAY, align="center")
+            # Prompt to return to menu
+            draw_text(self.screen, "Press ESC to return to Menu", 18, center_x, center_y + 80, COLOR_GRAY, align="center")
 
     def draw_music_controls(self):
-        """Draws the music control buttons and volume slider."""
-        if not self.game_music_files: return # Don't draw if no music
+        """Draws the music control buttons and volume slider in the top-right corner."""
+        # Don't draw if no music files were found
+        if not self.game_music_files: return
 
         mouse_pos = pygame.mouse.get_pos()
-        btn_color = (*COLOR_UI_BG[:3], 180)
+        btn_color = (*COLOR_UI_BG[:3], 180) # Semi-transparent background
         hover_color = (*COLOR_MENU_BUTTON_HOVER[:3], 220)
         border_color = COLOR_GRAY
         text_color = COLOR_WHITE
@@ -1995,473 +2702,620 @@ class Game:
             pygame.draw.rect(self.screen, handle_color, self.volume_slider_handle_rect, border_radius=3)
             pygame.draw.rect(self.screen, border_color, self.volume_slider_handle_rect, 1, border_radius=3) # Border
 
-            # Optional: Draw volume percentage text
+            # Optional: Draw volume percentage text next to slider
             if font_tiny:
                  vol_percent = int(self.current_volume * 100)
-                 # --- FIX: Define or replace margin ---
-                 text_margin = 5 # Use a small fixed margin value
+                 text_margin = 5
                  text_x = self.volume_slider_track_rect.right + text_margin
-                 # -------------------------------------
                  text_y = self.volume_slider_track_rect.centery
                  draw_text(self.screen, f"{vol_percent}%", 14, text_x, text_y, COLOR_GRAY, align="midleft")
         # ------------------
 
         # --- Draw Buttons ---
-        buttons = [
+        buttons_to_draw = [
             (self.prev_button_rect, "<<"),
+            # Dynamic label for play/pause button
             (self.play_pause_button_rect, "||" if self.music_playing else ">"),
             (self.next_button_rect, ">>")
         ]
 
-        for rect, text in buttons:
-            if rect:
+        for rect, text in buttons_to_draw:
+            if rect: # Ensure rect is not None
                 current_color = hover_color if rect.collidepoint(mouse_pos) else btn_color
                 pygame.draw.rect(self.screen, current_color, rect)
-                pygame.draw.rect(self.screen, border_color, rect, 1)
+                pygame.draw.rect(self.screen, border_color, rect, 1) # Border
                 draw_text(self.screen, text, 20, rect.centerx, rect.centery, text_color, align="center")
         # -------------------
 
-        # --- Draw Song Name ---
-        if font_tiny and self.current_song_index != -1:
+        # --- Draw Current Song Name (Optional) ---
+        # Position below the buttons
+        if font_tiny and self.current_song_index != -1 and self.prev_button_rect:
              try:
                  song_name = os.path.basename(self.game_music_files[self.current_song_index])
-                 name_x = self.prev_button_rect.left
-                 name_y = self.prev_button_rect.bottom + 5
+                 name_x = self.prev_button_rect.left # Align with first button
+                 name_y = self.prev_button_rect.bottom + 5 # Position below buttons
                  draw_text(self.screen, song_name, 14, name_x, name_y, COLOR_GRAY, align="topleft")
              except IndexError:
-                 pass
+                 pass # Ignore if index is temporarily out of bounds
         # --------------------
 
-    # --- Update Logic ---
-    # (update method remains the same, ensuring player/enemy boundary checks use self.map_width/height_px)
-    def update(self):
-        if not self.running: return
-        if self.network_mode in ["host", "sp"]:
-            for player in self.players.values(): player.update(self.dt, self) # Pass self for map bounds
-            for struct in list(self.structures.values()): struct.update(self)
-            for enemy in list(self.enemies.values()): enemy.update(self)
-            for proj in list(self.projectiles.values()): proj.update(self)
-            self.power_grid_update_timer += self.dt
-            if self.power_grid_update_timer >= self.power_grid_update_interval:
-                self.power_grid_update_timer -= self.power_grid_update_interval
-                self.update_power_grid()
-            # Cleanup
-            destroyed_sids = [sid for sid, s in self.structures.items() if s.destroyed]
-            core_died = False
-            for sid in destroyed_sids:
-                 if sid in self.structures:
-                     if self.structures[sid].building_type == BUILDING_CORE: core_died = True
-                     self._remove_structure_from_game(self.structures[sid])
-            destroyed_eids = [eid for eid, e in self.enemies.items() if e.destroyed]
-            for eid in destroyed_eids:
-                 if eid in self.enemies: del self.enemies[eid]
-            destroyed_pids = [pid for pid, p in self.projectiles.items() if p.destroyed]
-            for pid in destroyed_pids:
-                 if pid in self.projectiles: del self.projectiles[pid]
-            if self.network_mode == "host" and self.server:
-                 if destroyed_sids: self.server.broadcast_message({'type': 'structures_remove', 'ids': destroyed_sids})
-                 if destroyed_eids: self.server.broadcast_message({'type': 'enemies_remove', 'ids': destroyed_eids})
-                 if destroyed_pids: self.server.broadcast_message({'type': 'projectiles_remove', 'ids': destroyed_pids})
-            # Waves
-            self.wave_timer -= self.dt
-            if not self.in_wave and self.wave_timer <= 0 and self.wave_number < self.max_waves:
-                self.in_wave = True; self.wave_number += 1
-                self.enemies_to_spawn_this_wave = 10 + self.wave_number * 5
-                self.enemies_spawned_this_wave = 0; self.current_enemy_hp = ENEMY_START_HP + (self.wave_number - 1) * ENEMY_HP_INCREASE_PER_WAVE
-                self.wave_timer = WAVE_DURATION; self.enemy_spawn_timer = 0
-                print(f"SERVER/SP: --- Wave {self.wave_number}/{self.max_waves} Started ---")
-            if self.in_wave and self.enemies_spawned_this_wave < self.enemies_to_spawn_this_wave:
-                self.enemy_spawn_timer -= self.dt
-                if self.enemy_spawn_timer <= 0:
-                    self.spawn_enemy(); self.enemies_spawned_this_wave += 1
-                    interval = WAVE_DURATION / self.enemies_to_spawn_this_wave if self.enemies_to_spawn_this_wave > 0 else ENEMY_SPAWN_RATE
-                    self.enemy_spawn_timer = max(0.2, interval * random.uniform(0.7, 1.3))
-            ended = False; result = ''
-            if self.in_wave and (self.wave_timer <= 0 or (self.enemies_spawned_this_wave >= self.enemies_to_spawn_this_wave and not self.enemies)):
-                ended = True; result = 'Cleared' if not self.enemies else 'Ended'
-            if ended:
-                print(f"SERVER/SP: --- Wave {self.wave_number} {result} ---")
-                self.in_wave = False; self.wave_timer = WAVE_COOLDOWN
-            # Game End
-            if core_died and not self.game_over:
-                self.game_over = True; print("SERVER/SP: --- GAME OVER ---")
-                if self.network_mode == "host" and self.server: self.server.broadcast_message({'type': 'game_status', 'status': 'over'})
-            if self.wave_number >= self.max_waves and not self.in_wave and not self.enemies and not self.game_won and not self.game_over:
-                 self.game_won = True; print("SERVER/SP: --- YOU WIN! ---")
-                 if self.network_mode == "host" and self.server: self.server.broadcast_message({'type': 'game_status', 'status': 'won'})
-        elif self.network_mode == "client":
-            for struct in self.structures.values(): struct.client_update(self.dt)
-            for proj in self.projectiles.values(): proj.client_update(self.dt)
-            local_player = self.players.get(self.local_player_id)
-            if local_player: local_player.update(self.dt, self) # Update visual pos using self for bounds
-            if self.hovered_power_node_id:
-                self.network_stats_timer += self.dt
-                if self.network_stats is None or self.network_stats_timer >= POWER_NETWORK_STATS_UPDATE_INTERVAL:
-                    self.network_stats_timer = 0
-                    self.calculate_network_stats(self.hovered_power_node_id)
-
-    # --- Drawing Logic ---
-    # (draw_grid, draw_power_grid_connections, draw_build_preview, draw_overlay_screen remain the same)
-    def draw_grid(self):
-        map_end_y = self.map_height_px; grid_line_color = (60, 60, 60)
-        current_w = self.screen.get_width() # Use current width
-        for x in range(0, current_w, TILE_SIZE): pygame.draw.line(self.screen, grid_line_color, (x, 0), (x, map_end_y), 1)
-        for y in range(0, int(map_end_y) + 1, TILE_SIZE): pygame.draw.line(self.screen, grid_line_color, (0, y), (current_w, y), 1)
-
-    def draw_power_grid_connections(self):
-        """Draws power lines between nodes and from sources to consumers."""
-        drawn_connections = set()
-        line_color = COLOR_POWER_LINE
-
-        # 1. Draw connections between connected power NODES
-        for struct in self.structures.values():
-            # Only draw connections if the node is currently on a grid
-            if struct.is_power_node and struct.is_on_grid:
-                node_center = (int(struct.center_x), int(struct.center_y))
-                for neighbor_coords in struct.connected_nodes_coords:
-                    neighbor_center_int = (int(neighbor_coords[0]), int(neighbor_coords[1]))
-                    connection_key = tuple(sorted((node_center, neighbor_center_int)))
-                    if connection_key not in drawn_connections:
-                        pygame.draw.line(self.screen, line_color, node_center, neighbor_center_int, 1)
-                        drawn_connections.add(connection_key)
-
-        # 2. Draw connections from nodes to *OPERATIONAL* consumers
-        for struct in self.structures.values():
-             # Check if it's a consumer, if it's powered, AND if it has source coords synced
-             if struct.is_power_consumer and struct.is_powered and hasattr(struct, 'power_source_coords') and struct.power_source_coords:
-                 source_coords = struct.power_source_coords
-                 source_center_int = (int(source_coords[0]), int(source_coords[1]))
-                 consumer_center_int = (int(struct.center_x), int(struct.center_y))
-                 # Draw the line from the source coords to the consumer center
-                 pygame.draw.line(self.screen, line_color, source_center_int, consumer_center_int, 1)
-
-    def draw_build_preview(self):
-        if self.selected_building_type == BUILDING_NONE: return
-        local_player = self.players.get(self.local_player_id)
-        if not local_player: return
-        info = self.building_info.get(self.selected_building_type)
-        preview = self.preview_instances.get(self.selected_building_type)
-        if info is None or preview is None: return
-        mx, my = pygame.mouse.get_pos()
-        if my >= self.map_height_px: return
-        gx, gy = world_to_grid(mx, my); wx, wy = grid_to_world(gx, gy)
-        cost = info['cost']; can_afford = all(self.resources.get(res, 0) >= amount for res, amount in cost.items())
-        existing = self.get_structure_at(gx, gy); valid_tile = False
-        if info['class'] == Drill: valid_tile = isinstance(existing, ResourcePatch)
-        elif existing is None: valid_tile = True
-        tcx, tcy = grid_to_world_center(gx, gy); radius_sq = PLAYER_BUILD_RADIUS * PLAYER_BUILD_RADIUS
-        in_radius = distance_sq(local_player.world_x, local_player.world_y, tcx, tcy) <= radius_sq
-        valid_place = can_afford and valid_tile and in_radius
-        tint = None; alpha = 180
-        if not valid_place:
-            alpha = 150
-            if not in_radius: tint = COLOR_INVALID_RADIUS
-            elif not valid_tile: tint = (*COLOR_RED[:3], 120)
-            else: tint = (*COLOR_YELLOW[:3], 120)
-        preview_surf = pygame.Surface((TILE_SIZE, TILE_SIZE), pygame.SRCALPHA)
-        preview.world_x, preview.world_y = 0, 0; preview.center_x, preview.center_y = TILE_SIZE / 2.0, TILE_SIZE / 2.0
-        preview.draw(preview_surf); preview_surf.set_alpha(alpha)
-        if tint:
-            tint_surf = pygame.Surface((TILE_SIZE, TILE_SIZE), pygame.SRCALPHA); tint_surf.fill(tint)
-            preview_surf.blit(tint_surf, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
-        self.screen.blit(preview_surf, (wx, wy))
-
-    def draw_ui(self):
-        """Draws UI, including the power network tooltip."""
-        # (Keep existing UI drawing logic for resources, core, wave, build menu...)
-        current_w, current_h = self.screen.get_width(), self.screen.get_height()
-        ui_rect = pygame.Rect(0, current_h - UI_HEIGHT, current_w, UI_HEIGHT)
-        pygame.draw.rect(self.screen, COLOR_UI_BG, ui_rect)
-        pygame.draw.line(self.screen, COLOR_GRAY, (0, ui_rect.y), (current_w, ui_rect.y), 1)
-        if not all([font_tiny, font_small, font_medium]): return
-        res_fs, core_fs, wave_fs = 24, 24, 24; build_h_fs, build_i_fs, tt_fs = 16, 16, 14
-        y_r1 = ui_rect.y + 8
-        draw_text(self.screen, f"Cu: {self.resources.get(RES_COPPER, 0)}", res_fs, 15, y_r1, COLOR_COPPER)
-        draw_text(self.screen, f"Coal: {self.resources.get(RES_COAL, 0)}", res_fs, 150, y_r1, COLOR_COAL)
-        core_hp_t, core_c = "Core: N/A", COLOR_GRAY
-        if self.core:
-             if self.core.hp <= 0: core_hp_t, core_c = "Core: DEAD", COLOR_RED
-             else: core_hp_t, core_c = f"Core: {int(self.core.hp)}/{self.core.max_hp}", COLOR_GREEN if self.core.hp > self.core.max_hp * 0.3 else COLOR_YELLOW
-        draw_text(self.screen, core_hp_t, core_fs, 300, y_r1, core_c)
-        wave_t, wave_c = "", COLOR_YELLOW
-        if self.game_won: wave_t, wave_c = "YOU WIN!", COLOR_GREEN
-        elif self.game_over: wave_t, wave_c = "GAME OVER", COLOR_RED
-        elif self.in_wave: wave_t, wave_c = f"Wave: {self.wave_number}/{self.max_waves} ({len(self.enemies)} left)", COLOR_RED
-        elif self.wave_number >= self.max_waves: wave_t = "Clear remaining enemies!"
-        else: wave_t = f"Next Wave ({self.wave_number + 1}) in: {int(self.wave_timer)}s"
-        draw_text(self.screen, wave_t, wave_fs, 550, y_r1, wave_c, align="topleft")
-        mode_t = f"Mode: {self.network_mode.upper()}"
-        if self.network_mode == "host": mode_t += f" ({len(self.players)}/{MAX_PLAYERS})"
-        elif self.network_mode == "client": mode_t += " (Connected)" if self.client and self.client.connected else " (Connecting...)"
-        draw_text(self.screen, mode_t, 16, current_w - 15, y_r1 + 25, COLOR_NETWORK_STATUS, align="topright")
-        controls_t = "[WASD]Move [RMB]Del [U]Upgr [ESC]Menu"
-        draw_text(self.screen, controls_t, tt_fs, current_w - 15, y_r1 + 5, COLOR_GRAY, align="topright")
-        y_r2 = ui_rect.y + 40; sections = {'Production': [], 'Logistics': [], 'Defense': [], 'Power': [], 'Support': []}
-        for bt, info in self.building_info.items(): sections.setdefault(info.get('section', 'Other'), []).append(bt)
-        cur_x = 15; sec_space, item_space, item_pad_y = 10, 8, 20
-        key_inv = {v: k for k, v in self.key_to_building_type.items()}
-        for name, bt_list in sections.items():
-            if not bt_list: continue
-            h_y = y_r2; draw_text(self.screen, name, build_h_fs, cur_x, h_y, COLOR_UI_HEADER)
-            h_w = len(name) * 8; i_y = h_y + item_pad_y; start_x = cur_x
-            for bt in bt_list:
-                info = self.building_info[bt]
-                cost_s = "+".join([f"{a}{'C' if r == RES_COPPER else 'Co'}" for r, a in info['cost'].items()])
-                key_c = key_inv.get(bt, 0); key_n = key_c - pygame.K_0 if key_c >= pygame.K_1 else '?'
-                btn_t = f"[{key_n}] {info['name']} ({cost_s})"
-                sel = (self.selected_building_type == bt); afford = all(self.resources.get(r, 0) >= a for r, a in info['cost'].items())
-                t_col = COLOR_GREEN if sel else COLOR_UI_TEXT
-                if not afford: t_col = tuple(c // 2 for c in t_col)
-                surf = font_small.render(btn_t, True, t_col); draw_text(self.screen, btn_t, build_i_fs, cur_x, i_y, t_col)
-                cur_x += surf.get_width() + item_space
-            cur_x = max(cur_x, start_x + h_w) + sec_space
-        none_col = COLOR_GREEN if self.selected_building_type == BUILDING_NONE else COLOR_UI_TEXT
-        draw_text(self.screen, "[0] None", build_i_fs, cur_x, y_r2 + item_pad_y, none_col)
-
-        # --- Tooltip Drawing ---
-        # Check if hovering a node AND network stats have been calculated
-        if self.hovered_power_node_id and self.network_stats:
-            hovered_node = self.get_structure_by_id(self.hovered_power_node_id)
-            # Double check the hovered node still exists and is valid
-            if hovered_node and hovered_node.is_power_node:
-                stats = self.network_stats
-                mouse_x, mouse_y = pygame.mouse.get_pos()
-                box_x, box_y = mouse_x + 15, mouse_y + 10
-                line_height = 18; num_lines = 5; box_width = 200 # Adjusted width slightly
-                box_height = num_lines * line_height + 10
-
-                # Adjust position to stay on screen
-                if box_x + box_width > current_w: box_x = mouse_x - box_width - 15
-                # Adjust Y, ensure it doesn't overlap UI much or go off top
-                box_y = max(5, min(box_y, current_h - UI_HEIGHT - box_height - 5))
-
-
-                tooltip_bg_color = (*COLOR_UI_BG[:3], 230)
-                pygame.draw.rect(self.screen, tooltip_bg_color, (box_x, box_y, box_width, box_height))
-                pygame.draw.rect(self.screen, COLOR_GRAY, (box_x, box_y, box_width, box_height), 1)
-
-                y_offset = box_y + 5
-                net_power_color = COLOR_GREEN if stats['net'] >= -1e-6 else COLOR_RED
-
-                # Display the full network stats calculated by the (updated) client-side method
-                draw_text(self.screen, f"Network Stats:", tt_fs, box_x + 5, y_offset, COLOR_WHITE); y_offset += line_height
-                draw_text(self.screen, f" Nodes: {stats['nodes']}", tt_fs, box_x + 5, y_offset, COLOR_WHITE); y_offset += line_height
-                draw_text(self.screen, f" Generation: {stats['generation']:.1f}/s", tt_fs, box_x + 5, y_offset, COLOR_GREEN); y_offset += line_height
-                draw_text(self.screen, f" Consumption: {stats['consumption']:.1f}/s", tt_fs, box_x + 5, y_offset, COLOR_RED); y_offset += line_height
-                storage_text = f" Storage: {stats['charge']:.0f} / {stats['capacity']:.0f}"
-                draw_text(self.screen, storage_text, tt_fs, box_x + 5, y_offset, COLOR_BATTERY_CHARGE); y_offset += line_height
-                # Removed net power as it was less useful than storage info
-
-    def draw_overlay_screen(self, title, title_color, subtitle, subtitle_color, waves_survived=None):
-        overlay_color = (*COLOR_DARK_GRAY[:3], 220)
-        current_w, current_h = self.screen.get_width(), self.screen.get_height()
-        overlay_surface = pygame.Surface((current_w, current_h), pygame.SRCALPHA); overlay_surface.fill(overlay_color)
-        self.screen.blit(overlay_surface, (0, 0))
-        if font_large and font_medium and font_small:
-            cx, cy = current_w // 2, current_h // 2
-            draw_text(self.screen, title, 72, cx, cy - 60, title_color, align="center")
-            draw_text(self.screen, subtitle, 24, cx, cy + 10, subtitle_color, align="center")
-            if waves_survived is not None: draw_text(self.screen, f"Survived {max(0, waves_survived)} waves.", 18, cx, cy + 45, COLOR_GRAY, align="center")
-            draw_text(self.screen, "Press ESC to return to Menu", 18, cx, cy + 80, COLOR_GRAY, align="center")
-
-    # (draw method remains the same)
     def draw(self):
-        self.screen.fill(COLOR_DARK_GRAY); self.draw_grid()
-        for (gx, gy), res_type in self.base_terrain.items():
-             color = COLOR_COPPER if res_type == RES_COPPER else COLOR_COAL
-             rect = pygame.Rect(grid_to_world(gx, gy), (TILE_SIZE, TILE_SIZE))
-             pygame.draw.rect(self.screen, color, rect); pygame.draw.rect(self.screen, COLOR_BLACK, rect, 1)
-             ind_col = COLOR_BLACK if res_type == RES_COAL else COLOR_DARK_GRAY
-             cx, cy = grid_to_world_center(gx, gy)
-             pygame.draw.circle(self.screen, ind_col, (int(cx), int(cy)), TILE_SIZE // 5, 2)
-        for struct in self.structures.values(): struct.draw(self.screen)
-        self.draw_power_grid_connections()
-        for player in self.players.values(): player.draw(self.screen)
-        for enemy in self.enemies.values(): enemy.draw(self.screen)
-        for proj in self.projectiles.values(): proj.draw(self.screen)
-        self.draw_build_preview(); self.draw_ui(); self.draw_music_controls()
-        waves_survived = self.wave_number - 1 if (self.in_wave or self.game_over) else self.wave_number
-        if self.game_over: self.draw_overlay_screen("GAME OVER", COLOR_RED, "Core destroyed!", COLOR_WHITE, waves_survived)
-        elif self.game_won: self.draw_overlay_screen("YOU WIN!", COLOR_GREEN, f"Survived all {self.max_waves} waves!", COLOR_WHITE)
+        """Draws the entire game screen for one frame."""
+        # 1. Background / Grid
+        self.screen.fill(COLOR_DARK_GRAY)
+        self.draw_grid()
 
+        # 2. Base Terrain (Resource Patches)
+        self.draw_base_terrain()
+
+        # 3. Structures (Draws buildings from self.structures)
+        # Use list() to create a copy in case structures are modified during draw (less likely but safer)
+        for struct in list(self.structures.values()):
+            struct.draw(self.screen)
+
+        # 4. Power Grid Lines (Draw on top of structures)
+        self.draw_power_grid_connections()
+
+        # 5. Players
+        for player in self.players.values():
+            player.draw(self.screen)
+
+        # 6. Enemies
+        for enemy in self.enemies.values():
+            enemy.draw(self.screen)
+
+        # 7. Projectiles
+        for proj in self.projectiles.values():
+            proj.draw(self.screen)
+
+        # 8. Build Preview (Ghost image under cursor)
+        self.draw_build_preview()
+
+        # 9. Main UI (Bottom panel)
+        self.draw_ui()
+
+        # 10. Music Controls (Top right, drawn over UI/Game)
+        self.draw_music_controls()
+
+        # 11. Game Over / Win Overlay (Draw last if active)
+        waves_survived_count = self.wave_number - 1 if (self.in_wave or self.game_over) else self.wave_number
+        if self.game_over:
+            self.draw_overlay_screen("GAME OVER", COLOR_RED, "The core has been destroyed!", COLOR_WHITE, waves_survived_count)
+        elif self.game_won:
+            self.draw_overlay_screen("YOU WIN!", COLOR_GREEN, f"Survived all {self.max_waves} waves!", COLOR_WHITE)
+        # --- End Drawing ---
 
     # --- State Synchronization ---
-    # (get_full_snapshot and apply_full_snapshot remain the same as previous corrected version)
     def get_full_snapshot(self):
-        if self.network_mode == "client": return None
-        string_key_terrain = {f"{gx},{gy}": r for (gx, gy), r in self.base_terrain.items()}
+        """Gets the complete game state, suitable for saving or networking."""
+        if self.network_mode == "client": return None # Clients don't generate snapshots
+
+        # Convert terrain keys to strings for JSON compatibility
+        string_key_terrain = {}
+        for (gx, gy), r in self.base_terrain.items():
+            string_key_terrain[f"{gx},{gy}"] = r
+
         snapshot = {
-            'resources': self.resources.copy(), 'wave_number': self.wave_number, 'wave_timer': self.wave_timer,
-            'in_wave': self.in_wave, 'game_over': self.game_over, 'game_won': self.game_won,
+            'resources': self.resources.copy(),
+            'wave_number': self.wave_number,
+            'wave_timer': self.wave_timer,
+            'in_wave': self.in_wave,
+            'game_over': self.game_over,
+            'game_won': self.game_won,
             'players': {pid: p.get_state() for pid, p in self.players.items()},
+            # Ensure ResourcePatch objects are NOT included in structures snapshot
             'structures': {sid: s.get_state() for sid, s in self.structures.items() if s.building_type != BUILDING_RESOURCE},
             'enemies': {eid: e.get_state() for eid, e in self.enemies.items()},
             'projectiles': {pid: p.get_state() for pid, p in self.projectiles.items()},
             'base_terrain': string_key_terrain,
-            'core_hp': self.core.hp if self.core else 0, 'core_max_hp': self.core.max_hp if self.core else 0,
+            'core_hp': self.core.hp if self.core else 0,
+            'core_max_hp': self.core.max_hp if self.core else CORE_HP,
+            # --- ADDED FOR SAVING ---
+            'next_enemy_id': self.next_enemy_id,
+            'next_projectile_id': self.next_projectile_id,
+            'game_mode_for_save': self.network_mode # Store mode ('sp' or 'host')
+            # ------------------------
         }
         return snapshot
+
     def apply_full_snapshot(self, snapshot):
-        if self.network_mode == "sp" or self.network_mode == "host": return
+        """Applies a complete game state snapshot (from network or save file)."""
+        # Avoid applying state on server/SP mode from external source typically
+        # But allow for save game loading which calls this internally
+        # if self.network_mode == "sp" or self.network_mode == "host": return
+
+        print("DEBUG: Applying full snapshot...") # Add more detailed logging if needed
+
+        # --- Apply Basic State ---
         self.resources = snapshot.get('resources', self.resources)
-        self.wave_number = snapshot.get('wave_number', self.wave_number); self.wave_timer = snapshot.get('wave_timer', self.wave_timer)
-        self.in_wave = snapshot.get('in_wave', self.in_wave); self.game_over = snapshot.get('game_over', self.game_over)
+        self.wave_number = snapshot.get('wave_number', self.wave_number)
+        self.wave_timer = snapshot.get('wave_timer', self.wave_timer)
+        self.in_wave = snapshot.get('in_wave', self.in_wave)
+        self.game_over = snapshot.get('game_over', self.game_over)
         self.game_won = snapshot.get('game_won', self.game_won)
-        if not self.base_terrain:
-            received_terrain = snapshot.get('base_terrain')
-            if received_terrain:
-                self.base_terrain = {}
+        # Apply next IDs if loading from save
+        self.next_enemy_id = snapshot.get('next_enemy_id', self.next_enemy_id)
+        self.next_projectile_id = snapshot.get('next_projectile_id', self.next_projectile_id)
+        # --- End Basic State ---
+
+        # --- Apply Base Terrain (Only if not already populated) ---
+        # Check if base_terrain dict is empty OR if loading from a save file explicitly
+        is_loading_from_save = 'game_mode_for_save' in snapshot # Check if it's a save file snapshot
+        if not self.base_terrain or is_loading_from_save:
+            received_terrain_str = snapshot.get('base_terrain')
+            if received_terrain_str:
+                new_base_terrain = {}
+                new_grid = [[None for _ in range(self.grid_height)] for _ in range(self.grid_width)] # Start with fresh grid
                 try:
-                    for sk, rt in received_terrain.items(): parts = sk.split(','); self.base_terrain[(int(parts[0]), int(parts[1]))] = rt
-                    self.grid = [[None for _ in range(self.grid_height)] for _ in range(self.grid_width)]
-                    for (gx, gy), rt in self.base_terrain.items():
-                       if 0 <= gx < self.grid_width and 0 <= gy < self.grid_height: self.grid[gx][gy] = ResourcePatch(gx, gy, rt)
-                    print(f"CLIENT: Applied base terrain ({len(self.base_terrain)} patches).")
-                except Exception as e: print(f"ERROR: Parsing terrain failed: {e}"); self.base_terrain = {}
-        # Players
-        recv_players = snapshot.get('players', {}); curr_pids = set(self.players.keys()); recv_pids = set()
-        new_p_dict = {}
-        for pk, p_data in recv_players.items():
-             try: pid = int(pk); recv_pids.add(pid)
-             except ValueError: continue
-             if pid in self.players: self.players[pid].apply_state(p_data); new_p_dict[pid] = self.players[pid]
-             else: new_p = Player(p_data['x'], p_data['y'], pid, p_data['name'], p_data['color_idx']); new_p_dict[pid] = new_p; print(f"CLIENT: Created player {pid} ('{new_p.name}')")
-        ids_to_rem = curr_pids - recv_pids
-        if ids_to_rem: print(f"CLIENT: Players removed (not in snapshot): {ids_to_rem}")
-        self.players = new_p_dict
-        # Structures
-        recv_structs = snapshot.get('structures', {}); curr_sids = set(self.structures.keys()); recv_sids = set(recv_structs.keys())
-        new_s_dict = {}; core_data, core_id = None, None
-        for sid, s_data in recv_structs.items():
-            recv_sids.add(sid); b_type = s_data.get('type')
-            if b_type == BUILDING_CORE: core_data, core_id = s_data, sid; continue
-            if sid in self.structures: self.structures[sid].apply_state(s_data); new_s_dict[sid] = self.structures[sid]
-            else:
-                gx, gy = s_data.get('gx'), s_data.get('gy'); info = self.building_info.get(b_type)
-                if info and gx is not None and gy is not None:
-                    NewC = info['class']; orient = s_data.get('orientation', EAST) if b_type == BUILDING_CONVEYOR else None
-                    try:
-                        new_s = NewC(gx, gy, orient) if orient else NewC(gx, gy)
-                        new_s.network_id = sid; new_s.apply_state(s_data); new_s_dict[sid] = new_s
+                    for str_key, res_type in received_terrain_str.items():
+                        parts = str_key.split(',')
+                        gx, gy = int(parts[0]), int(parts[1])
+                        new_base_terrain[(gx, gy)] = res_type
+                        # Place visual patch on the new grid
                         if 0 <= gx < self.grid_width and 0 <= gy < self.grid_height:
-                           grid_c = self.grid[gx][gy]
-                           is_rep_patch = isinstance(grid_c, ResourcePatch) and isinstance(new_s, Drill)
-                           is_not_p_or_not_d = not isinstance(grid_c, ResourcePatch) or not isinstance(new_s, Drill)
-                           if is_rep_patch or is_not_p_or_not_d: self.grid[gx][gy] = new_s
-                    except Exception as e: print(f"CLIENT: Error creating struct {sid} (type {b_type}): {e}")
-        # Core Handling
-        if core_data:
-            if self.core: self.core.apply_state(core_data); new_s_dict[core_id] = self.core
+                            new_grid[gx][gy] = ResourcePatch(gx, gy, res_type)
+                    self.base_terrain = new_base_terrain
+                    self.grid = new_grid # Replace old grid
+                    print(f"Applied base terrain ({len(self.base_terrain)} patches).")
+                except Exception as e:
+                    print(f"ERROR parsing base_terrain from snapshot: {e}")
+                    # Keep existing terrain/grid if parsing failed severely? Or clear them?
+                    self.base_terrain = {}
+                    self.grid = [[None for _ in range(self.grid_height)] for _ in range(self.grid_width)]
             else:
-                gx, gy = core_data.get('gx'), core_data.get('gy')
-                if gx is not None and gy is not None:
-                    self.core = Core(gx, gy); self.core.network_id = core_id; self.core.apply_state(core_data)
-                    new_s_dict[core_id] = self.core;
-                    if 0 <= gx < self.grid_width and 0 <= gy < self.grid_height: self.grid[gx][gy] = self.core
-                    print("CLIENT: Created Core from snapshot.")
-                else: print("ERROR: Core data missing coords.")
-        elif self.core: print("CLIENT: Core missing from snapshot, assuming destroyed."); gx, gy = self.core.grid_x, self.core.grid_y; self.core = None
-        sids_to_rem = curr_sids - recv_sids
-        if sids_to_rem:
-            # print(f"CLIENT: Structures removed (not in snapshot): {sids_to_rem}") # Can be noisy
-            for sid in sids_to_rem:
-                 if sid in self.structures:
-                     struct = self.structures[sid]
-                     if not isinstance(struct, Core) or self.core is None:
-                          gx, gy = struct.grid_x, struct.grid_y
-                          if 0 <= gx < self.grid_width and 0 <= gy < self.grid_height and self.grid[gx][gy] == struct:
-                               bt = self.base_terrain.get((gx,gy)); self.grid[gx][gy] = ResourcePatch(gx,gy,bt) if bt else None
-        self.structures = new_s_dict
-        # Core HP
-        if self.core: self.core.hp = snapshot.get('core_hp', self.core.hp)
-        # Enemies
-        recv_e = snapshot.get('enemies', {}); curr_eids = set(self.enemies.keys()); recv_eids = set(recv_e.keys())
-        new_e_dict = {}
-        for eid, e_data in recv_e.items():
-            recv_eids.add(eid)
-            if eid in self.enemies: self.enemies[eid].apply_state(e_data); new_e_dict[eid] = self.enemies[eid]
-            else:
-                dc = (self.map_width_px/2, self.map_height_px/2)
-                new_e = Enemy(e_data['x'], e_data['y'], dc, e_data['hp'], ENEMY_SPEED, ENEMY_DAMAGE, ENEMY_ATTACK_COOLDOWN, eid)
-                new_e.apply_state(e_data); new_e_dict[eid] = new_e
-        self.enemies = new_e_dict
-        # Projectiles
-        recv_p = snapshot.get('projectiles', {}); curr_pids = set(self.projectiles.keys()); recv_pids = set(recv_p.keys())
-        new_p_dict = {}
-        for pid, p_data in recv_p.items():
-             recv_pids.add(pid)
-             if pid in self.projectiles: self.projectiles[pid].apply_state(p_data); new_p_dict[pid] = self.projectiles[pid]
-             else:
-                 px,py,vx,vy = p_data.get('x'), p_data.get('y'), p_data.get('vx'), p_data.get('vy')
-                 if px is not None and py is not None and vx is not None and vy is not None:
-                     try: new_p = Projectile(px, py, None, PROJECTILE_SPEED, 0, pid, vx=vx, vy=vy); new_p_dict[pid] = new_p
-                     except Exception as e: print(f"CLIENT: Error creating projectile {pid}: {e}")
-                 else: print(f"CLIENT: Invalid projectile data: {p_data}")
-        self.projectiles = new_p_dict
+                 # If no terrain in snapshot, ensure local state is clear
+                 self.base_terrain = {}
+                 self.grid = [[None for _ in range(self.grid_height)] for _ in range(self.grid_width)]
+        # --- End Base Terrain ---
 
-    # (apply_incremental_update remains the same)
-    def apply_incremental_update(self, update_data):
-        update_type = update_data.get('type'); data = update_data.get('data'); net_id = update_data.get('net_id'); ids = update_data.get('ids')
-        if update_type == 'player_join':
-            pid = data.get('id')
-            if pid is not None and pid not in self.players:
-                new_p = Player(data['x'], data['y'], pid, data['name'], data['color_idx']); self.players[pid] = new_p
-                print(f"CLIENT: Player {pid} ('{new_p.name}') joined.")
-            elif pid == self.local_player_id and not self.players.get(pid):
-                 self.players[pid] = Player(data['x'], data['y'], pid, data['name'], data['color_idx'])
-        elif update_type == 'player_leave':
-            pid = update_data.get('player_id')
-            if pid is not None and pid in self.players: print(f"CLIENT: Player {pid} left."); del self.players[pid]
-        elif update_type == 'assign_id': self.local_player_id = data.get('id'); print(f"CLIENT: Assigned ID: {self.local_player_id}")
-        elif update_type == 'game_status': status = update_data.get('status'); self.game_over = (status=='over'); self.game_won = (status=='won')
-        elif update_type == 'resource_update': self.resources = data
-        elif update_type == 'wave_update':
-             self.wave_number = data.get('number', self.wave_number); self.wave_timer = data.get('timer', self.wave_timer); self.in_wave = data.get('in_wave', self.in_wave)
-        elif update_type == 'structure_add':
-             sid = data.get('net_id'); b_type = data.get('type'); gx, gy = data.get('gx'), data.get('gy')
-             info = self.building_info.get(b_type)
-             if sid and info and gx is not None and gy is not None and sid not in self.structures:
-                 NewC = info['class']; orient = data.get('orientation', EAST) if b_type == BUILDING_CONVEYOR else None
+
+        # --- Sync Players ---
+        received_players = snapshot.get('players', {})
+        current_player_ids = set(self.players.keys())
+        received_player_ids = set()
+        new_player_dict = {} # Build the new dictionary incrementally
+
+        for pid_str, player_data in received_players.items():
+             try:
+                 pid = int(pid_str)
+                 received_player_ids.add(pid)
+                 if pid in self.players:
+                     # Update existing player
+                     self.players[pid].apply_state(player_data)
+                     new_player_dict[pid] = self.players[pid] # Keep updated player
+                 else:
+                     # Create new player
+                     # Use data from snapshot, provide defaults if keys missing
+                     start_x = player_data.get('x', self.map_width_px / 2)
+                     start_y = player_data.get('y', self.map_height_px / 2)
+                     name = player_data.get('name', f"Player{pid}")
+                     color_idx = player_data.get('color_idx', pid % len(COLOR_PLAYER_OPTIONS))
+                     new_player = Player(start_x, start_y, pid, name=name, color_index=color_idx)
+                     new_player_dict[pid] = new_player
+                     print(f"Created player {pid} ('{new_player.name}') from snapshot.")
+             except (ValueError, TypeError) as e:
+                 print(f"Error processing player data for key '{pid_str}': {e}")
+                 continue # Skip this player
+
+        # Identify players to remove (present locally but not in snapshot)
+        ids_to_remove = current_player_ids - received_player_ids
+        if ids_to_remove:
+             print(f"Players removed (not in snapshot): {ids_to_remove}")
+
+        self.players = new_player_dict # Replace player dictionary
+        # --- End Sync Players ---
+
+
+        # --- Sync Structures ---
+        received_structures = snapshot.get('structures', {})
+        current_structure_ids = set(self.structures.keys())
+        received_structure_ids = set(received_structures.keys())
+        new_structure_dict = {} # Build the new dictionary
+
+        core_data_from_snapshot = None
+        core_id_from_snapshot = None
+
+        for sid, struct_data in received_structures.items():
+            building_type = struct_data.get('type')
+            if building_type == BUILDING_CORE:
+                # Handle core separately after main loop
+                core_data_from_snapshot = struct_data
+                core_id_from_snapshot = sid
+                continue # Skip adding core to new_structure_dict here
+
+            if sid in self.structures:
+                # Update existing structure
+                try:
+                    self.structures[sid].apply_state(struct_data)
+                    new_structure_dict[sid] = self.structures[sid] # Keep updated structure
+                    # Update grid reference as well
+                    gx, gy = self.structures[sid].grid_x, self.structures[sid].grid_y
+                    if 0 <= gx < self.grid_width and 0 <= gy < self.grid_height:
+                         self.grid[gx][gy] = self.structures[sid]
+                except Exception as e:
+                     print(f"Error applying state to structure {sid}: {e}")
+            else:
+                # Create new structure
+                gx, gy = struct_data.get('gx'), struct_data.get('gy')
+                info = self.building_info.get(building_type)
+                if info and gx is not None and gy is not None:
+                    BuildingClass = info['class']
+                    orientation = struct_data.get('orientation', EAST) if building_type == BUILDING_CONVEYOR else None
+                    try:
+                        new_struct = BuildingClass(gx, gy, orientation) if orientation is not None else BuildingClass(gx, gy)
+                        new_struct.network_id = sid # Assign the ID from the snapshot
+                        new_struct.apply_state(struct_data) # Apply the rest of the state
+                        new_structure_dict[sid] = new_struct
+                        # Place on grid, potentially overwriting ResourcePatch visual
+                        if 0 <= gx < self.grid_width and 0 <= gy < self.grid_height:
+                            self.grid[gx][gy] = new_struct
+                        # print(f"DEBUG: Created structure {sid} ({BuildingClass.__name__}) from snapshot.")
+                    except Exception as e:
+                        print(f"ERROR creating structure {sid} (type {building_type}) from snapshot: {e}")
+                else:
+                    print(f"WARN: Invalid data or missing info for new structure {sid} (type {building_type}). Skipping.")
+
+        # --- Core Handling ---
+        if core_data_from_snapshot:
+            if self.core and self.core.network_id == core_id_from_snapshot:
+                 # Update existing core
+                 self.core.apply_state(core_data_from_snapshot)
+                 new_structure_dict[core_id_from_snapshot] = self.core # Add to new dict
+                 gx, gy = self.core.grid_x, self.core.grid_y
+                 if 0 <= gx < self.grid_width and 0 <= gy < self.grid_height: self.grid[gx][gy] = self.core # Ensure grid ref
+                 # print("DEBUG: Updated existing core from snapshot.")
+            else:
+                 # Create new core if missing or ID doesn't match
+                 gx, gy = core_data_from_snapshot.get('gx'), core_data_from_snapshot.get('gy')
+                 if gx is not None and gy is not None:
+                      if self.core: print("WARN: Replacing existing core object.") # Should ideally not happen if IDs match
+                      self.core = Core(gx, gy)
+                      self.core.network_id = core_id_from_snapshot
+                      self.core.apply_state(core_data_from_snapshot)
+                      new_structure_dict[core_id_from_snapshot] = self.core # Add to new dict
+                      if 0 <= gx < self.grid_width and 0 <= gy < self.grid_height: self.grid[gx][gy] = self.core # Place on grid
+                      print("Created Core from snapshot.")
+                 else: print("ERROR: Core data in snapshot missing coordinates.")
+        elif self.core:
+             # Core exists locally but not in snapshot - remove local core
+             print("WARN: Core missing from snapshot, removing local core.")
+             gx, gy = self.core.grid_x, self.core.grid_y
+             if 0 <= gx < self.grid_width and 0 <= gy < self.grid_height and self.grid[gx][gy] == self.core:
+                  base_type = self.base_terrain.get((gx, gy))
+                  self.grid[gx][gy] = ResourcePatch(gx, gy, base_type) if base_type else None
+             self.core = None
+
+        # Identify structures to remove
+        struct_ids_to_remove = current_structure_ids - received_structure_ids
+        # Make sure not to remove the current core if it wasn't in the received dict but still exists
+        if self.core and self.core.network_id in struct_ids_to_remove:
+             struct_ids_to_remove.remove(self.core.network_id)
+
+        if struct_ids_to_remove:
+            # print(f"DEBUG: Structures removed (not in snapshot): {struct_ids_to_remove}")
+            for sid in struct_ids_to_remove:
+                 # Ensure grid is cleared where structure was removed
+                 if sid in self.structures: # Get coords from old dict before replacing
+                      old_struct = self.structures[sid]
+                      gx, gy = old_struct.grid_x, old_struct.grid_y
+                      if 0 <= gx < self.grid_width and 0 <= gy < self.grid_height and self.grid[gx][gy] == old_struct:
+                           base_type = self.base_terrain.get((gx, gy))
+                           self.grid[gx][gy] = ResourcePatch(gx, gy, base_type) if base_type else None
+
+        self.structures = new_structure_dict # Replace structure dictionary
+
+        # Ensure core HP matches snapshot explicitly (apply_state might be overridden)
+        if self.core:
+             self.core.hp = snapshot.get('core_hp', self.core.hp)
+             self.core.max_hp = snapshot.get('core_max_hp', self.core.max_hp)
+        # --- End Sync Structures ---
+
+
+        # --- Sync Enemies ---
+        received_enemies = snapshot.get('enemies', {})
+        current_enemy_ids = set(self.enemies.keys())
+        received_enemy_ids = set(received_enemies.keys())
+        new_enemy_dict = {}
+
+        for eid, enemy_data in received_enemies.items():
+            if eid in self.enemies:
+                 # Update existing enemy
                  try:
-                     new_s = NewC(gx, gy, orient) if orient else NewC(gx, gy); new_s.network_id = sid; new_s.apply_state(data)
-                     self.structures[sid] = new_s
-                     if 0 <= gx < self.grid_width and 0 <= gy < self.grid_height: self.grid[gx][gy] = new_s
-                     if b_type == BUILDING_CORE: self.core = new_s
-                 except Exception as e: print(f"CLIENT: Error adding struct {sid}: {e}")
-        elif update_type == 'structure_update':
-             sid = data.get('net_id')
-             if sid in self.structures: self.structures[sid].apply_state(data)
-             if self.core and sid == self.core.network_id: self.core.apply_state(data) # Apply to core too if matched
-        elif update_type == 'structure_remove' and net_id and net_id in self.structures:
-             s = self.structures[net_id]; gx, gy = s.grid_x, s.grid_y; del self.structures[net_id]
-             if 0 <= gx < self.grid_width and 0 <= gy < self.grid_height and self.grid[gx][gy] == s:
-                  bt = self.base_terrain.get((gx,gy)); self.grid[gx][gy] = ResourcePatch(gx,gy,bt) if bt else None
-        elif update_type == 'structures_remove' and ids:
-             for sid in ids:
-                 if sid in self.structures:
-                     s = self.structures[sid]; gx, gy = s.grid_x, s.grid_y; del self.structures[sid]
-                     if 0 <= gx < self.grid_width and 0 <= gy < self.grid_height and self.grid[gx][gy] == s:
-                          bt = self.base_terrain.get((gx,gy)); self.grid[gx][gy] = ResourcePatch(gx,gy,bt) if bt else None
-        elif update_type == 'enemy_add':
-            eid = data.get('net_id')
-            if eid and eid not in self.enemies:
-                dc = (self.map_width_px/2, self.map_height_px/2)
-                new_e = Enemy(data['x'], data['y'], dc, data['hp'], ENEMY_SPEED, ENEMY_DAMAGE, ENEMY_ATTACK_COOLDOWN, eid)
-                new_e.apply_state(data); self.enemies[eid] = new_e
-        elif update_type == 'enemies_remove' and ids:
-            for eid in ids:
-                if eid in self.enemies: del self.enemies[eid]
-        elif update_type == 'projectile_add':
-             pid = data.get('net_id')
-             if pid and pid not in self.projectiles:
-                 px,py,vx,vy = data.get('x'), data.get('y'), data.get('vx'), data.get('vy')
-                 if px is not None and py is not None and vx is not None and vy is not None:
-                     try: new_p = Projectile(px, py, None, PROJECTILE_SPEED, 0, pid, vx=vx, vy=vy); self.projectiles[pid] = new_p
-                     except Exception as e: print(f"CLIENT: Error adding projectile {pid}: {e}")
-        elif update_type == 'projectiles_remove' and ids:
-             for pid in ids:
-                 if pid in self.projectiles: del self.projectiles[pid]
+                      self.enemies[eid].apply_state(enemy_data)
+                      new_enemy_dict[eid] = self.enemies[eid]
+                 except Exception as e: print(f"Error applying state to enemy {eid}: {e}")
+            else:
+                 # Create new enemy
+                 try:
+                      # Provide defaults for constructor if data is minimal
+                      pos_x = enemy_data.get('x', 0)
+                      pos_y = enemy_data.get('y', 0)
+                      hp = enemy_data.get('hp', ENEMY_START_HP)
+                      # Target coords don't strictly matter for client/load, use placeholder
+                      target_coords = (self.map_width_px/2, self.map_height_px/2)
+                      new_enemy = Enemy(pos_x, pos_y, target_coords, hp, ENEMY_SPEED, ENEMY_DAMAGE, ENEMY_ATTACK_COOLDOWN, eid)
+                      new_enemy.apply_state(enemy_data) # Apply full state after creation
+                      new_enemy_dict[eid] = new_enemy
+                 except Exception as e: print(f"ERROR creating enemy {eid} from snapshot: {e}")
 
+        self.enemies = new_enemy_dict # Replace enemy dictionary
+        # --- End Sync Enemies ---
+
+
+        # --- Sync Projectiles ---
+        received_projectiles = snapshot.get('projectiles', {})
+        current_projectile_ids = set(self.projectiles.keys())
+        received_projectile_ids = set(received_projectiles.keys())
+        new_projectile_dict = {}
+
+        for pid, proj_data in received_projectiles.items():
+             if pid in self.projectiles:
+                  # Update existing projectile
+                  try:
+                       self.projectiles[pid].apply_state(proj_data)
+                       new_projectile_dict[pid] = self.projectiles[pid]
+                  except Exception as e: print(f"Error applying state to projectile {pid}: {e}")
+             else:
+                  # Create new projectile
+                  px, py = proj_data.get('x'), proj_data.get('y')
+                  vx, vy = proj_data.get('vx'), proj_data.get('vy')
+                  if px is not None and py is not None and vx is not None and vy is not None:
+                       try:
+                            # Target obj is None when creating from state, provide velocity directly
+                            new_proj = Projectile(px, py, None, PROJECTILE_SPEED, 0, pid, vx=vx, vy=vy)
+                            # No apply_state needed if constructor takes all values, but call if exists for consistency
+                            if hasattr(new_proj, 'apply_state'): new_proj.apply_state(proj_data)
+                            new_projectile_dict[pid] = new_proj
+                       except Exception as e: print(f"ERROR creating projectile {pid} from snapshot: {e}")
+                  else: print(f"WARN: Invalid projectile data in snapshot for {pid}. Skipping.")
+
+        self.projectiles = new_projectile_dict # Replace projectile dictionary
+        # --- End Sync Projectiles ---
+
+        print("DEBUG: Finished applying full snapshot.")
+
+
+    def apply_incremental_update(self, update_data):
+        """Applies smaller, targeted updates received over the network (Client only)."""
+        if self.network_mode == "sp" or self.network_mode == "host": return # Only clients process these
+
+        update_type = update_data.get('type')
+        data = update_data.get('data')
+        net_id = update_data.get('net_id') # For single item removal/update
+        ids = update_data.get('ids')       # For batch removal
+
+        try: # Wrap processing in a try-except block for safety
+            if update_type == 'player_join':
+                pid = data.get('id')
+                if pid is not None and pid not in self.players:
+                    # Create new player based on join data
+                    new_p = Player(data['x'], data['y'], pid, data['name'], data['color_idx'])
+                    self.players[pid] = new_p
+                    print(f"CLIENT: Player {pid} ('{new_p.name}') joined.")
+                elif pid == self.local_player_id and not self.players.get(pid):
+                    # Recreate local player if missing (e.g., after some error)
+                    self.players[pid] = Player(data['x'], data['y'], pid, data['name'], data['color_idx'])
+
+            elif update_type == 'player_leave':
+                pid = update_data.get('player_id')
+                if pid is not None and pid in self.players:
+                    print(f"CLIENT: Player {pid} left.")
+                    del self.players[pid]
+
+            elif update_type == 'assign_id': # Server assigns client its ID
+                assigned_id = data.get('id')
+                if assigned_id is not None:
+                     self.local_player_id = assigned_id
+                     print(f"CLIENT: Assigned Player ID: {self.local_player_id}")
+                     # Ensure player object exists after assignment
+                     if self.local_player_id not in self.players:
+                          # Need initial pos/name/color - maybe request full state again?
+                          # Or server should send player data with assign_id
+                          print(f"WARN: Player object for assigned ID {self.local_player_id} not found.")
+
+
+            elif update_type == 'game_status': # Game over/win
+                status = update_data.get('status')
+                self.game_over = (status == 'over')
+                self.game_won = (status == 'won')
+                if self.game_over: print("CLIENT: Received Game Over status.")
+                if self.game_won: print("CLIENT: Received Game Won status.")
+
+            elif update_type == 'resource_update': # Full resource dict update
+                if isinstance(data, dict): self.resources = data
+
+            elif update_type == 'wave_update': # Wave number, timer, status
+                 if isinstance(data, dict):
+                      self.wave_number = data.get('number', self.wave_number)
+                      self.wave_timer = data.get('timer', self.wave_timer)
+                      self.in_wave = data.get('in_wave', self.in_wave)
+
+            elif update_type == 'structure_add': # Add a single new structure
+                 sid = data.get('net_id')
+                 b_type = data.get('type')
+                 gx, gy = data.get('gx'), data.get('gy')
+                 info = self.building_info.get(b_type)
+                 if sid and info and gx is not None and gy is not None and sid not in self.structures:
+                     BuildingClass = info['class']
+                     orient = data.get('orientation', EAST) if b_type == BUILDING_CONVEYOR else None
+                     new_s = BuildingClass(gx, gy, orient) if orient is not None else BuildingClass(gx, gy)
+                     new_s.network_id = sid
+                     new_s.apply_state(data) # Apply full state from message
+                     self.structures[sid] = new_s
+                     # Place on grid
+                     if 0 <= gx < self.grid_width and 0 <= gy < self.grid_height: self.grid[gx][gy] = new_s
+                     if b_type == BUILDING_CORE: self.core = new_s # Assign core ref
+
+            elif update_type == 'structure_update': # Update state of existing structure
+                 sid = data.get('net_id')
+                 if sid in self.structures:
+                     self.structures[sid].apply_state(data)
+                     # Also update core ref if it's the core being updated
+                     if self.core and sid == self.core.network_id: self.core.apply_state(data)
+
+            elif update_type == 'structure_remove': # Remove single structure by ID
+                 if net_id and net_id in self.structures:
+                     s = self.structures[net_id]
+                     gx, gy = s.grid_x, s.grid_y
+                     del self.structures[net_id]
+                     # Clear grid cell or restore resource patch visual
+                     if 0 <= gx < self.grid_width and 0 <= gy < self.grid_height and self.grid[gx][gy] == s:
+                          base_type = self.base_terrain.get((gx, gy))
+                          self.grid[gx][gy] = ResourcePatch(gx, gy, base_type) if base_type else None
+                     if self.core and net_id == self.core.network_id: self.core = None # Clear core ref
+
+            elif update_type == 'structures_remove': # Remove multiple structures by ID list
+                 if ids and isinstance(ids, list):
+                     for sid in ids:
+                         if sid in self.structures:
+                             s = self.structures[sid]; gx, gy = s.grid_x, s.grid_y
+                             del self.structures[sid]
+                             if 0 <= gx < self.grid_width and 0 <= gy < self.grid_height and self.grid[gx][gy] == s:
+                                  base_type = self.base_terrain.get((gx, gy))
+                                  self.grid[gx][gy] = ResourcePatch(gx, gy, base_type) if base_type else None
+                             if self.core and sid == self.core.network_id: self.core = None
+
+            elif update_type == 'enemy_add': # Add single enemy
+                eid = data.get('net_id')
+                if eid and eid not in self.enemies:
+                    target_coords = (self.map_width_px/2, self.map_height_px/2) # Placeholder target
+                    new_e = Enemy(data['x'], data['y'], target_coords, data['hp'], ENEMY_SPEED, ENEMY_DAMAGE, ENEMY_ATTACK_COOLDOWN, eid)
+                    new_e.apply_state(data)
+                    self.enemies[eid] = new_e
+
+            elif update_type == 'enemies_remove': # Remove multiple enemies by ID list
+                if ids and isinstance(ids, list):
+                    for eid in ids:
+                        if eid in self.enemies: del self.enemies[eid]
+
+            elif update_type == 'projectile_add': # Add single projectile
+                 pid = data.get('net_id')
+                 if pid and pid not in self.projectiles:
+                     px, py, vx, vy = data.get('x'), data.get('y'), data.get('vx'), data.get('vy')
+                     if px is not None and py is not None and vx is not None and vy is not None:
+                         new_p = Projectile(px, py, None, PROJECTILE_SPEED, 0, pid, vx=vx, vy=vy)
+                         self.projectiles[pid] = new_p
+
+            elif update_type == 'projectiles_remove': # Remove multiple projectiles by ID list
+                 if ids and isinstance(ids, list):
+                     for pid in ids:
+                         if pid in self.projectiles: del self.projectiles[pid]
+
+            # Add more incremental update types as needed (e.g., player position, structure HP only)
+
+        except Exception as e:
+             print(f"ERROR applying incremental update (type: {update_type}): {e}")
+             # Consider requesting full state sync from server on error?
+
+
+    # --- Music Control Methods ---
+    def _setup_music_controls_ui(self):
+        """Calculates the positions for music control buttons and volume slider."""
+        try:
+            screen_w = self.screen.get_width()
+            btn_size = 28
+            margin = 10
+            slider_height = 8
+            slider_width = 80
+            handle_height = 16
+            handle_width = 10
+            slider_bottom_margin = 8
+
+            # Slider Positioning
+            slider_y = 10
+            slider_x = screen_w - margin - slider_width
+
+            self.volume_slider_track_rect = pygame.Rect(slider_x, slider_y, slider_width, slider_height)
+            handle_center_x = slider_x + int(self.current_volume * slider_width)
+            handle_y = slider_y + (slider_height / 2) - (handle_height / 2)
+            self.volume_slider_handle_rect = pygame.Rect(0, handle_y, handle_width, handle_height)
+            self.volume_slider_handle_rect.centerx = handle_center_x
+
+            # Button Positioning (relative to slider)
+            buttons_y = slider_y + slider_height + slider_bottom_margin
+            buttons_x_start = screen_w - margin - (btn_size * 3 + margin * 2)
+
+            self.prev_button_rect = pygame.Rect(buttons_x_start, buttons_y, btn_size, btn_size)
+            self.play_pause_button_rect = pygame.Rect(buttons_x_start + btn_size + margin, buttons_y, btn_size, btn_size)
+            self.next_button_rect = pygame.Rect(buttons_x_start + (btn_size + margin) * 2, buttons_y, btn_size, btn_size)
+        except Exception as e:
+             print(f"Error setting up music controls UI: {e}")
+             self.volume_slider_track_rect = None
+             self.volume_slider_handle_rect = None
+             self.prev_button_rect = None
+             self.play_pause_button_rect = None
+             self.next_button_rect = None
+
+
+    def load_and_play_song(self, index):
+        """Loads and plays a song by index from the game music list."""
+        if not self.game_music_files or not (0 <= index < len(self.game_music_files)):
+            print("WARN: Invalid song index or no music files.")
+            self.current_song_index = -1
+            self.music_playing = False
+            try: pygame.mixer.music.stop()
+            except pygame.error: pass
+            return
+
+        self.current_song_index = index
+        song_path = self.game_music_files[self.current_song_index]
+        try:
+            print(f"MUSIC: Loading '{os.path.basename(song_path)}'")
+            pygame.mixer.music.load(song_path)
+            pygame.mixer.music.set_volume(self.current_volume) # Ensure volume is set before playing
+            pygame.mixer.music.play(0) # Play once
+            pygame.mixer.music.set_endevent(MUSIC_END_EVENT)
+            self.music_playing = True
+        except pygame.error as e:
+            print(f"ERROR: Could not load/play music '{song_path}': {e}")
+            self.music_playing = False
+            self.current_song_index = -1
+
+    def play_next_song(self):
+        """Plays the next song in the list, wrapping around."""
+        if not self.game_music_files: return
+        next_index = 0 if self.current_song_index == -1 else (self.current_song_index + 1) % len(self.game_music_files)
+        self.load_and_play_song(next_index)
+
+    def play_prev_song(self):
+        """Plays the previous song in the list, wrapping around."""
+        if not self.game_music_files: return
+        prev_index = len(self.game_music_files) - 1 if self.current_song_index == -1 else (self.current_song_index - 1) % len(self.game_music_files)
+        self.load_and_play_song(prev_index)
+
+    def toggle_pause(self):
+        """Toggles pause/unpause for the game music."""
+        if not self.game_music_files:
+             print("WARN: No game music files to play/pause.")
+             return
+
+        try:
+            if pygame.mixer.music.get_busy(): # Is music playing or paused?
+                if self.music_playing: # We think it's playing, so pause it
+                    pygame.mixer.music.pause()
+                    self.music_playing = False
+                    print("MUSIC: Paused")
+                else: # We think it's paused, so unpause it
+                    pygame.mixer.music.unpause()
+                    self.music_playing = True
+                    print("MUSIC: Unpaused")
+            else: # Music is not busy (stopped or never started)
+                 print("MUSIC: No song active or finished, starting next song.")
+                 # Start the next song (or first if none was selected)
+                 self.play_next_song()
+
+        except pygame.error as e:
+            print(f"ERROR: Music pause/unpause/play error: {e}")
+            # Reset state potentially
+            self.music_playing = pygame.mixer.music.get_busy() and not self.music_playing # Try to resync based on mixer state
+
+    def handle_music_end_event(self):
+        """Called from main loop when MUSIC_END_EVENT is received."""
+        print("MUSIC: Song finished, playing next.")
+        # When a song naturally ends, automatically play the next one
+        self.music_playing = False # Mark as not playing before starting next
+        self.play_next_song()
+    # --- End Music Control ---
 
 # --- Network Server Class ---
 # (Server class remains the same as previous corrected version, including set_game_instance)
@@ -2668,7 +3522,7 @@ def main():
     pygame.init()
     pygame.font.init()
 
-    # --- Load Configuration ---
+    # --- Load Application Configuration ---
     # Define default config first
     app_config = {
         'name': "Player",
@@ -2676,69 +3530,51 @@ def main():
         'host_ip': "127.0.0.1",
         'resolution_index': DEFAULT_RESOLUTION_INDEX,
         'network_interval': DEFAULT_NETWORK_UPDATE_INTERVAL,
-        # Add volume later if needed, start with default from constant
+        'volume': DEFAULT_MUSIC_VOLUME, # Default volume
     }
-    # Keep track of loaded volume separately initially
-    loaded_volume = DEFAULT_MUSIC_VOLUME
+    loaded_volume = DEFAULT_MUSIC_VOLUME # Separate variable for loading
 
     print(f"Attempting to load configuration from {CONFIG_FILENAME}...")
     try:
         with open(CONFIG_FILENAME, 'r') as f:
             loaded_config = json.load(f)
-
             # Validate and update app_config with loaded values
             app_config['name'] = str(loaded_config.get('name', app_config['name'])).strip()[:16]
             app_config['color_index'] = int(loaded_config.get('color_index', app_config['color_index']))
             app_config['host_ip'] = str(loaded_config.get('host_ip', app_config['host_ip'])).strip()
             app_config['resolution_index'] = int(loaded_config.get('resolution_index', app_config['resolution_index']))
             app_config['network_interval'] = float(loaded_config.get('network_interval', app_config['network_interval']))
-            # Load volume, clamping it between 0.0 and 1.0
             loaded_volume = max(0.0, min(1.0, float(loaded_config.get('volume', DEFAULT_MUSIC_VOLUME))))
-
-
             print("Configuration loaded successfully.")
-
     except FileNotFoundError:
         print(f"Configuration file '{CONFIG_FILENAME}' not found. Using defaults.")
     except (json.JSONDecodeError, TypeError, ValueError) as e:
         print(f"Error loading or parsing configuration file: {e}. Using defaults.")
-        # Keep the default app_config and loaded_volume defined above
 
-    # --- Validate loaded/default values ---
-    # Validate Resolution Index
+    # --- Validate loaded/default config values ---
     if not (0 <= app_config['resolution_index'] < len(AVAILABLE_RESOLUTIONS)):
         print(f"WARN: Invalid resolution index ({app_config['resolution_index']}) found. Resetting to default.")
         app_config['resolution_index'] = DEFAULT_RESOLUTION_INDEX
-
-    # Validate and Clamp Network Interval
     try:
         net_interval = float(app_config['network_interval'])
-        app_config['network_interval'] = max(MIN_NETWORK_UPDATE_INTERVAL,
-                                             min(net_interval, MAX_NETWORK_UPDATE_INTERVAL))
+        app_config['network_interval'] = max(MIN_NETWORK_UPDATE_INTERVAL, min(net_interval, MAX_NETWORK_UPDATE_INTERVAL))
     except (ValueError, TypeError):
         print(f"WARN: Invalid network interval ({app_config['network_interval']}) found. Resetting to default.")
         app_config['network_interval'] = DEFAULT_NETWORK_UPDATE_INTERVAL
-
-    # Validate Color Index
     if not (0 <= app_config['color_index'] < len(COLOR_PLAYER_OPTIONS)):
          print(f"WARN: Invalid color index ({app_config['color_index']}). Clamping.")
          app_config['color_index'] = max(0, min(app_config['color_index'], len(COLOR_PLAYER_OPTIONS) - 1))
-
-    # Validate Volume (already clamped during load attempt)
-    app_config['volume'] = loaded_volume # Add validated volume to app_config
+    app_config['volume'] = loaded_volume # Assign validated volume to app_config
 
     print(f"Final Initial Config: Name='{app_config['name']}', ResIndex={app_config['resolution_index']}, NetInterval={app_config['network_interval']:.4f}, Volume={app_config['volume']:.2f}")
     # --- END Load Configuration ---
-
 
     # --- Mixer Initialization ---
     menu_music_loaded = False
     try:
         pygame.mixer.init()
         print("Audio Mixer Initialized.")
-        # Set initial volume based on loaded/default config
-        pygame.mixer.music.set_volume(app_config['volume'])
-        # Pre-load menu music
+        pygame.mixer.music.set_volume(app_config['volume']) # Set initial volume
         try:
             if os.path.exists(MAIN_MENU_MUSIC_FILE):
                 pygame.mixer.music.load(MAIN_MENU_MUSIC_FILE)
@@ -2750,53 +3586,117 @@ def main():
             print(f"ERROR: Could not load main menu music: {e}")
     except pygame.error as e:
         print(f"ERROR: Failed to initialize audio mixer: {e}")
-    # ----------------------------------
+    # -----------------------------
 
-    # --- Screen Initialization (Uses validated app_config) ---
+    # --- Screen Initialization ---
     try:
         initial_width, initial_height = AVAILABLE_RESOLUTIONS[app_config['resolution_index']]
     except IndexError:
         print(f"FATAL: Corrected resolution index still invalid? Using default.")
         app_config['resolution_index'] = DEFAULT_RESOLUTION_INDEX
         initial_width, initial_height = AVAILABLE_RESOLUTIONS[DEFAULT_RESOLUTION_INDEX]
-
     screen = pygame.display.set_mode((initial_width, initial_height))
     pygame.display.set_caption(GAME_TITLE)
     clock = pygame.time.Clock()
     # --- End Screen Init ---
 
+    # --- Font Initialization ---
     init_fonts()
     if not font_medium: print("FATAL: Font load failed."); pygame.quit(); sys.exit()
+    # -------------------------
+
+    # --- State Definitions ---
+    STATE_MAIN_MENU = 0
+    STATE_PLAYING_SP = 1
+    STATE_SETTINGS = 2
+    STATE_HOSTING = 3
+    STATE_JOINING = 4
+    STATE_PLAYING_MP_CLIENT = 5
+    STATE_SHOW_IP = 6
+    STATE_PROMPT_NEW_LOAD = 7
+    # -----------------------
 
     current_state = STATE_MAIN_MENU
-    # --- Play menu music initially ---
-    if menu_music_loaded:
-        try:
-            pygame.mixer.music.play(-1, fade_ms=MUSIC_FADE_MS) # Loop indefinitely
-        except pygame.error as e:
-            print(f"ERROR: Failed to play initial menu music: {e}")
-    # ---------------------------------------
+    previous_state = -1 # Track state changes for music
 
-    # --- Initialize Menus (Use loaded/validated app_config) ---
+    # --- Initialize Menus ---
     main_menu = MainMenu(screen, clock)
     settings_menu = SettingsMenu(screen, clock,
-                                 app_config['name'],
-                                 app_config['color_index'],
-                                 app_config['resolution_index'],
-                                 app_config['network_interval']) # Pass initial values
-    settings_menu.current_ip = app_config['host_ip'] # Set initial IP in settings menu
-    # --- End Menu Init ---
+                                 app_config['name'], app_config['color_index'],
+                                 app_config['resolution_index'], app_config['network_interval'])
+    settings_menu.current_ip = app_config['host_ip']
+    # ----------------------
 
-    game_instance = None;
-    server_instance = None;
+    # --- Game and Network Instance Variables ---
+    game_instance = None
+    server_instance = None
     client_instance = None
-    app_running = True;
-    previous_state = -1
-    current_network_interval = app_config['network_interval'] # Use validated interval
-    last_network_update_time = 0.0;
+    # -----------------------------------------
+
+    app_running = True
+    current_network_interval = app_config['network_interval']
+    last_network_update_time = 0.0
     local_ip_address = get_local_ip()
 
-    # --- Main Loop ---
+    # --- Variables for New/Load Prompt ---
+    prompt_mode_target = None # 'sp' or 'host'
+    prompt_save_exists = False
+    prompt_buttons = []
+    # ------------------------------------
+
+    # --- Helper Function for Save/Load ---
+    def save_game_state(game_mode):
+        """Saves the current game instance state to the appropriate file."""
+        if not game_instance: return False
+        filename = SAVE_FILENAME_SP if game_mode == 'sp' else SAVE_FILENAME_HOST
+        print(f"Attempting to save game state to {filename}...")
+        try:
+            snapshot = game_instance.get_full_snapshot()
+            if snapshot:
+                 snapshot['game_mode_for_save'] = game_mode # Ensure mode is saved
+                 with open(filename, 'w') as f:
+                      json.dump(snapshot, f, indent=2)
+                 print("Game state saved successfully.")
+                 return True
+            else:
+                 print("Failed to get game snapshot for saving.")
+                 return False
+        except Exception as e:
+            print(f"ERROR: Could not save game state: {e}")
+            return False
+
+    def load_game_state(game_mode):
+        """Loads game state from the appropriate file."""
+        filename = SAVE_FILENAME_SP if game_mode == 'sp' else SAVE_FILENAME_HOST
+        print(f"Attempting to load game state from {filename}...")
+        try:
+            with open(filename, 'r') as f:
+                load_data = json.load(f)
+            loaded_mode = load_data.get('game_mode_for_save')
+            if loaded_mode != game_mode:
+                 print(f"WARN: Save file mode ({loaded_mode}) doesn't match requested mode ({game_mode}). Aborting load.")
+                 return None
+            print("Game state loaded successfully.")
+            return load_data
+        except FileNotFoundError:
+            print(f"Save file '{filename}' not found.")
+            return None
+        except (json.JSONDecodeError, TypeError, ValueError, KeyError) as e:
+            print(f"Error loading or parsing save file: {e}. Cannot load.")
+            return None
+    # --- End Save/Load Helpers ---
+
+    # --- Play initial menu music ---
+    if menu_music_loaded:
+        try:
+            pygame.mixer.music.play(-1, fade_ms=MUSIC_FADE_MS)
+        except pygame.error as e:
+            print(f"ERROR: Failed to play initial menu music: {e}")
+    # -----------------------------
+
+    # =================== #
+    # --- MAIN LOOP --- #
+    # =================== #
     while app_running:
         dt = min(clock.tick(FPS) / 1000.0, 0.1) # Delta time in seconds
         events_this_frame = pygame.event.get()
@@ -2807,418 +3707,367 @@ def main():
             if event.type == pygame.QUIT:
                 app_running = False; break
             if event.type == MUSIC_END_EVENT:
-                # Handle song ending if in a game state
                 if game_instance and current_state in [STATE_PLAYING_SP, STATE_HOSTING, STATE_PLAYING_MP_CLIENT]:
                     game_instance.handle_music_end_event()
-        if not app_running: break # Exit loop immediately if QUIT detected
+        if not app_running: break
         # --- End Global Events ---
 
-
-        # --- State Change Music Logic ---
+        # --- State Change Music & Volume Logic ---
         if current_state != previous_state:
             print(f"State changed from {previous_state} to {current_state}")
             is_game_state = current_state in [STATE_PLAYING_SP, STATE_HOSTING, STATE_PLAYING_MP_CLIENT]
             was_menu_state = previous_state == STATE_MAIN_MENU
             was_game_state = previous_state in [STATE_PLAYING_SP, STATE_HOSTING, STATE_PLAYING_MP_CLIENT]
+            is_settings_state = current_state == STATE_SETTINGS
 
-            # Fade out music if leaving menu OR leaving game state
-            if was_menu_state or was_game_state:
-                try:
-                    pygame.mixer.music.fadeout(MUSIC_FADE_MS)
-                    print("Music fading out...")
-                except pygame.error as e:
-                    print(f"WARN: Error fading out music: {e}")
+            # Fade out music if leaving menu (but NOT going to settings) OR leaving game
+            if (was_menu_state and not is_settings_state) or was_game_state:
+                 if pygame.mixer.music.get_busy():
+                     try: pygame.mixer.music.fadeout(MUSIC_FADE_MS)
+                     except pygame.error: pass # Ignore errors during fadeout
 
-            # Start menu music if entering menu (and it's loaded)
+            # Play menu music if entering MAIN MENU
             if current_state == STATE_MAIN_MENU and menu_music_loaded:
-                try:
-                    # Stop ensures no leftover game music interferes before load/play
-                    pygame.mixer.music.stop()
-                    pygame.mixer.music.load(MAIN_MENU_MUSIC_FILE)
-                    # Use current volume from app_config
-                    pygame.mixer.music.set_volume(app_config['volume'])
-                    pygame.mixer.music.play(-1, fade_ms=MUSIC_FADE_MS)
-                    print(f"Menu music playing at volume {app_config['volume']:.2f}.")
-                except pygame.error as e:
-                    print(f"ERROR: Failed to play menu music on state change: {e}")
+                 if not pygame.mixer.music.get_busy(): # Start only if not already playing/fading
+                     try:
+                         pygame.mixer.music.stop()
+                         pygame.mixer.music.load(MAIN_MENU_MUSIC_FILE)
+                         pygame.mixer.music.set_volume(app_config['volume'])
+                         pygame.mixer.music.play(-1, fade_ms=MUSIC_FADE_MS)
+                         print(f"Menu music playing at volume {app_config['volume']:.2f}.")
+                     except pygame.error as e: print(f"ERROR: Failed to play menu music: {e}")
 
-            # If entering a game state, music might start via game instance controls
-            # Ensure volume is set correctly when entering game
-            if is_game_state:
+            # Set mixer volume when entering any game state or settings
+            if is_game_state or is_settings_state:
                  try:
-                      # Set volume, even if music isn't playing yet
                       pygame.mixer.music.set_volume(app_config['volume'])
-                      print(f"Game state entered, mixer volume set to {app_config['volume']:.2f}.")
-                      # Optionally, auto-start first game song if desired
-                      # if game_instance and not pygame.mixer.music.get_busy():
-                      #     game_instance.load_and_play_song(0)
-                 except pygame.error as e:
-                      print(f"WARN: Error setting volume on game state entry: {e}")
-
+                      print(f"State {current_state} entered, mixer volume set to {app_config['volume']:.2f}.")
+                 except pygame.error as e: print(f"WARN: Error setting volume on state entry: {e}")
 
             previous_state = current_state # Update tracker
         # --- END State Change Music Logic ---
-
 
         # --- Update Network Instances ---
         if server_instance and server_instance.running: server_instance.update()
         if client_instance and client_instance.running:
             client_instance.update()
-            # Check for disconnection AFTER updating client
             if not client_instance.connected and current_state == STATE_PLAYING_MP_CLIENT:
                 print("CLIENT: Disconnected. Returning to menu.")
-                current_state = STATE_MAIN_MENU;
-                game_instance = None;
-                client_instance = None
-                # Add a small delay or message screen? Optional.
-                continue # Skip rest of the frame processing
+                current_state = STATE_MAIN_MENU; game_instance = None; client_instance = None
+                continue
         # --- End Network Update ---
 
+        # -------------------------- #
+        # --- STATE MACHINE --- #
+        # -------------------------- #
 
-        # --- State-Specific Logic ---
+        # --- Main Menu ---
         if current_state == STATE_MAIN_MENU:
-            main_menu.screen = screen # Ensure menu uses current screen surface
+            main_menu.screen = screen
             for event in events_this_frame: main_menu.handle_event(event)
             action = main_menu.get_action()
             if action == "quit":
                 app_running = False
-            elif action == "play_sp":
-                current_state = STATE_PLAYING_SP
-                game_instance = Game(screen, clock, app_config, network_mode="sp")
-                # Update game instance volume based on current config
-                if game_instance: game_instance.current_volume = app_config['volume']
-            elif action == "host_mp":
-                server_instance = Server('', DEFAULT_PORT);
-                game_instance = Game(screen, clock, app_config, network_mode="host", server=server_instance)
-                if game_instance: game_instance.current_volume = app_config['volume'] # Set initial volume
-                server_instance.set_game_instance(game_instance);
-                server_instance.start()
-                if server_instance.running:
-                    host_player = game_instance.players.get(0) # Host is player 0
-                    if host_player:
-                        with server_instance.game_lock:
-                            server_instance.initial_snapshot = game_instance.get_full_snapshot()
-                        print(f"SERVER: Hosting started. Player 0 ('{host_player.name}') added. Snapshot created.")
-                    else:
-                        print("ERROR: Host player (ID 0) not found after game instance creation!")
-                    current_state = STATE_SHOW_IP
-                else:
-                    print("Error: Failed to start server."); server_instance = None; game_instance = None
+            elif action == "play_sp" or action == "host_mp":
+                # Transition to Prompt State
+                prompt_mode_target = 'sp' if action == "play_sp" else 'host'
+                save_file = SAVE_FILENAME_SP if prompt_mode_target == 'sp' else SAVE_FILENAME_HOST
+                prompt_save_exists = os.path.exists(save_file)
+                current_state = STATE_PROMPT_NEW_LOAD
+                # Setup prompt buttons
+                prompt_buttons = []
+                btn_w, btn_h = 250, 50; cx, cy = screen.get_width()//2, screen.get_height()//2
+                prompt_buttons.append({'rect': pygame.Rect(cx-btn_w//2, cy-btn_h*1.5-10, btn_w, btn_h), 'text': 'Start New Game', 'action': 'new_game'})
+                if prompt_save_exists:
+                     prompt_buttons.append({'rect': pygame.Rect(cx-btn_w//2, cy-btn_h*0.5, btn_w, btn_h), 'text': 'Load Game', 'action': 'load_game'})
+                prompt_buttons.append({'rect': pygame.Rect(cx-btn_w//2, cy+btn_h*0.5+10, btn_w, btn_h), 'text': 'Cancel', 'action': 'cancel_prompt'})
             elif action == "join_mp":
                 current_state = STATE_JOINING;
                 target_ip = app_config.get('host_ip', '127.0.0.1')
                 client_instance = Client(target_ip, DEFAULT_PORT, app_config)
                 if client_instance.connect():
-                    # Create game instance AFTER successful connection
                     game_instance = Game(screen, clock, app_config, network_mode="client", client=client_instance)
-                    if game_instance: game_instance.current_volume = app_config['volume'] # Set initial volume
+                    # Client volume is controlled locally via slider, config sets initial
+                    if game_instance: game_instance.current_volume = app_config['volume']
                     current_state = STATE_PLAYING_MP_CLIENT
-                    print("CLIENT: Connected successfully, entering game state.")
                 else:
-                    print(f"Error: Failed connect to {target_ip}. Returning to menu.");
-                    client_instance = None; # Ensure client is None if connect failed
-                    current_state = STATE_MAIN_MENU
+                    print(f"Error: Failed connect to {target_ip}."); client_instance = None; current_state = STATE_MAIN_MENU
             elif action == "settings":
-                # Update settings menu with CURRENT app_config before showing
                 settings_menu.screen = screen;
                 settings_menu.current_name = app_config['name']
                 settings_menu.selected_color_index = app_config['color_index']
                 settings_menu.current_resolution_index = app_config['resolution_index']
                 settings_menu.current_network_interval_str = f"{current_network_interval:.4f}"
                 settings_menu.current_ip = app_config['host_ip']
-                # Do NOT set volume here, SettingsMenu doesn't handle it directly
                 settings_menu.input_active = settings_menu.ip_input_active = settings_menu.interval_input_active = False
                 settings_menu._setup_ui();
                 current_state = STATE_SETTINGS
 
+        # --- New/Load Prompt ---
+        elif current_state == STATE_PROMPT_NEW_LOAD:
+            clicked_action = None
+            for event in events_this_frame:
+                 if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                      for btn in prompt_buttons:
+                           if btn['rect'].collidepoint(event.pos): clicked_action = btn['action']; break
+                 elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE: clicked_action = 'cancel_prompt'
+            if clicked_action:
+                 if clicked_action == 'cancel_prompt': current_state = STATE_MAIN_MENU
+                 else:
+                      load_data = None
+                      if clicked_action == 'load_game':
+                           load_data = load_game_state(prompt_mode_target)
+                           if load_data is None: current_state = STATE_MAIN_MENU; continue # Load failed
+
+                      # Start Game (New or Loaded)
+                      if prompt_mode_target == 'sp':
+                           game_instance = Game(screen, clock, app_config, network_mode='sp', load_data=load_data)
+                           if game_instance: game_instance.current_volume = app_config['volume']
+                           current_state = STATE_PLAYING_SP
+                      elif prompt_mode_target == 'host':
+                           server_instance = Server('', DEFAULT_PORT)
+                           game_instance = Game(screen, clock, app_config, network_mode='host', server=server_instance, load_data=load_data)
+                           if game_instance: game_instance.current_volume = app_config['volume']
+                           server_instance.set_game_instance(game_instance)
+                           server_instance.start()
+                           if server_instance.running:
+                                with server_instance.game_lock: server_instance.initial_snapshot = game_instance.get_full_snapshot()
+                                print(f"HOST: Initial snapshot created for {'loaded' if load_data else 'new'} game.")
+                                current_state = STATE_SHOW_IP
+                           else:
+                                print("Error: Failed server start."); server_instance=None; game_instance=None; current_state = STATE_MAIN_MENU
+            # Drawing handled below in draw section
+
+        # --- Settings ---
         elif current_state == STATE_SETTINGS:
             settings_menu.screen = screen;
             settings_action = None
             for event in events_this_frame:
                 settings_action = settings_menu.handle_event(event)
                 if settings_action == 'back': break
-            settings_menu.update(dt) # Update cursor blink etc.
-
+            settings_menu.update(dt)
             if settings_action == 'back':
                 new_settings = settings_menu.get_settings();
                 resolution_changed = (new_settings['resolution_index'] != app_config['resolution_index'])
-
-                # Update app_config (volume is NOT in new_settings)
-                app_config['name'] = new_settings['name']
-                app_config['color_index'] = new_settings['color_index']
-                app_config['host_ip'] = new_settings['host_ip']
-                app_config['resolution_index'] = new_settings['resolution_index']
-                app_config['network_interval'] = new_settings['network_interval']
-
-                current_network_interval = app_config['network_interval'] # Update interval used by host state
-                print(f"Settings Updated & Stored in app_config: ResIndex={app_config['resolution_index']}, NetInterval={current_network_interval:.4f}")
-
-                # Apply Resolution Change
-                if resolution_changed:
+                # Update app_config (volume not handled by settings menu)
+                app_config.update({k: v for k, v in new_settings.items() if k != 'volume'}) # Exclude volume
+                current_network_interval = app_config['network_interval']
+                print(f"Settings Updated & Stored in app_config")
+                if resolution_changed: # Apply resolution change
                     try:
                         new_w, new_h = AVAILABLE_RESOLUTIONS[app_config['resolution_index']]
-                        print(f"Applying resolution: {new_w}x{new_h}")
                         screen = pygame.display.set_mode((new_w, new_h))
-                        # Update screen references for menus
-                        main_menu.screen = screen;
-                        settings_menu.screen = screen
-                        # If game_instance exists (unlikely here, but safety), update its screen ref too
+                        main_menu.screen = screen; settings_menu.screen = screen
                         if game_instance: game_instance.screen = screen
                     except Exception as e:
                         print(f"ERROR applying resolution: {e}")
-                        app_config['resolution_index'] = DEFAULT_RESOLUTION_INDEX # Revert config
+                        app_config['resolution_index'] = DEFAULT_RESOLUTION_INDEX
                         def_w, def_h = AVAILABLE_RESOLUTIONS[DEFAULT_RESOLUTION_INDEX]
-                        screen = pygame.display.set_mode((def_w, def_h)) # Apply default screen
-                        # Update screen references
-                        main_menu.screen = screen;
-                        settings_menu.screen = screen
+                        screen = pygame.display.set_mode((def_w, def_h))
+                        main_menu.screen = screen; settings_menu.screen = screen
                         if game_instance: game_instance.screen = screen
+                current_state = STATE_MAIN_MENU
 
-                current_state = STATE_MAIN_MENU # Go back to menu
-
+        # --- Show IP ---
         elif current_state == STATE_SHOW_IP:
-            # Display IP info - this state now auto-transitions
-            current_w, current_h = screen.get_width(), screen.get_height()
-            screen.fill(COLOR_DARK_GRAY)
-            draw_text(screen, f"Hosting on IP: {local_ip_address}", 36, current_w // 2, current_h // 2 - 40, COLOR_WHITE, align="center")
-            draw_text(screen, f"Port: {DEFAULT_PORT}", 36, current_w // 2, current_h // 2, COLOR_WHITE, align="center")
-            draw_text(screen, f"Update Interval: {current_network_interval:.3f}s", 24, current_w // 2, current_h // 2 + 40, COLOR_GRAY, align="center")
-            draw_text(screen, "Waiting for players... Press ESC to cancel", 24, current_w // 2, current_h - 50, COLOR_GRAY, align="center")
-            pygame.display.flip()
-
-            # Check only for ESC key to cancel hosting
-            esc_pressed = False
+            esc_pressed = False # Only check for ESC to cancel
             for event in events_this_frame:
-                 if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                      esc_pressed = True; break
+                 if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE: esc_pressed = True; break
             if esc_pressed:
-                 print("Hosting cancelled by user.")
-                 current_state = STATE_MAIN_MENU
+                 print("Hosting cancelled."); current_state = STATE_MAIN_MENU
                  if server_instance: server_instance.stop(); server_instance = None
                  game_instance = None
-            else:
-                 # Stay in this state visually, game logic runs in HOSTING state
-                 current_state = STATE_HOSTING
+            else: current_state = STATE_HOSTING # Auto-transition to hosting logic
+            # Drawing handled below
 
-
+        # --- Hosting Game ---
         elif current_state == STATE_HOSTING:
             if not game_instance or not server_instance or not server_instance.running:
-                print("ERROR: Hosting state invalid. Returning to menu.");
-                current_state = STATE_MAIN_MENU
+                print("ERROR: Hosting state invalid."); current_state = STATE_MAIN_MENU
                 if server_instance: server_instance.stop(); server_instance = None
-                game_instance = None;
-                continue # Skip rest of frame
+                game_instance = None; continue
 
-            # Handle HOST player input + process network inputs
             queued_inputs = server_instance.get_queued_inputs()
+            host_esc_pressed = False
             with server_instance.game_lock:
-                # Process inputs received from clients
-                for net_input in queued_inputs:
+                for net_input in queued_inputs: # Process client inputs
                     pid, payload = net_input['player_id'], net_input['payload']
                     act_type, act_data = payload.get('action'), payload.get('data')
                     player = game_instance.players.get(pid)
-                    if player:
-                        if act_type == 'move':
-                            player.move_x, player.move_y = act_data.get('x', 0), act_data.get('y', 0)
-                        elif act_type == 'place':
-                            game_instance.action_place_structure(pid, act_data['type'], act_data['gx'], act_data['gy'], act_data['orient'])
-                        elif act_type == 'remove':
-                            game_instance.action_remove_structure(pid, act_data['gx'], act_data['gy'])
-                        elif act_type == 'upgrade':
-                            game_instance.action_upgrade_structure(pid, act_data['gx'], act_data['gy'])
+                    if player: # Apply actions
+                         if act_type == 'move': player.move_x, player.move_y = act_data.get('x',0), act_data.get('y',0)
+                         elif act_type == 'place': game_instance.action_place_structure(pid, act_data['type'], act_data['gx'], act_data['gy'], act_data['orient'])
+                         elif act_type == 'remove': game_instance.action_remove_structure(pid, act_data['gx'], act_data['gy'])
+                         elif act_type == 'upgrade': game_instance.action_upgrade_structure(pid, act_data['gx'], act_data['gy'])
 
-                # Handle input for the host player (Player 0)
-                # Pass app_config to handle_events if needed, but Game uses its own state mostly
-                game_instance.handle_events(events_this_frame)
-                if not game_instance.running: # Check if ESC was pressed in game
-                    action = 'back_to_menu'
+                game_instance.handle_events(events_this_frame) # Handle host input
+                if not game_instance.running: host_esc_pressed = True # Host pressed ESC
 
-                # Update Game State (Server authoritative)
-                game_instance.dt = dt
-                game_instance.update()
+                game_instance.dt = dt; game_instance.update() # Update game simulation
 
-                # Update game volume based on host's setting (might be controlled by game UI now)
-                app_config['volume'] = game_instance.current_volume # Sync back from game slider
-                try:
-                     pygame.mixer.music.set_volume(app_config['volume'])
+                app_config['volume'] = game_instance.current_volume # Sync volume back
+                try: pygame.mixer.music.set_volume(app_config['volume'])
                 except pygame.error: pass
 
-            # Network Broadcast State
-            current_time = time.time()
+            current_time = time.time() # Broadcast state periodically
             if current_time - last_network_update_time >= current_network_interval:
-                last_network_update_time = current_time;
-                snapshot = None
-                with server_instance.game_lock:
-                    snapshot = game_instance.get_full_snapshot()
+                last_network_update_time = current_time; snapshot = None
+                with server_instance.game_lock: snapshot = game_instance.get_full_snapshot()
                 if snapshot: server_instance.broadcast_message({'type': 'state_update', 'data': snapshot})
 
-            # Check if host wants to leave
-            if action == 'back_to_menu':
+            if host_esc_pressed: # Handle host leaving
+                save_game_state('host')
                 current_state = STATE_MAIN_MENU;
-                server_instance.stop();
-                server_instance = None;
+                if server_instance: server_instance.stop(); server_instance = None;
                 game_instance = None
 
-
+        # --- Playing as Client ---
         elif current_state == STATE_PLAYING_MP_CLIENT:
-            if not game_instance or not client_instance: # Connection loss handled earlier
-                print("ERROR: Client state invalid. Returning to menu.")
-                current_state = STATE_MAIN_MENU
+            if not game_instance or not client_instance:
+                print("ERROR: Client state invalid."); current_state = STATE_MAIN_MENU
                 if client_instance: client_instance.disconnect(); client_instance = None
-                game_instance = None
-                continue
+                game_instance = None; continue
 
             game_instance.screen = screen # Update screen ref
-
-            # Process Received Server Messages
-            received = client_instance.get_received_messages()
+            client_esc_pressed = False
             error_processing = False
-            try:
-                for msg in received:
-                    msg_type = msg.get('type')
-                    msg_data = msg.get('data')
+            try: # Process server messages
+                for msg in client_instance.get_received_messages():
+                    msg_type, msg_data = msg.get('type'), msg.get('data')
                     if not msg_type: continue
-
-                    if msg_type == 'initial_state':
-                        print("CLIENT: Applying initial state.")
-                        if msg_data: game_instance.apply_full_snapshot(msg_data)
-                    elif msg_type == 'state_update':
-                        if msg_data: game_instance.apply_full_snapshot(msg_data)
-                    else:
-                        game_instance.apply_incremental_update(msg)
-
+                    if msg_type == 'initial_state': game_instance.apply_full_snapshot(msg_data)
+                    elif msg_type == 'state_update': game_instance.apply_full_snapshot(msg_data)
+                    else: game_instance.apply_incremental_update(msg)
             except Exception as e:
-                print("\n--- CLIENT ERROR PROCESSING SERVER MESSAGE ---")
-                print(f"Error Type: {type(e).__name__}, Details: {e}")
-                # import traceback; traceback.print_exc() # Uncomment for detailed stack trace
-                print("---------------------------------------------")
-                print("CLIENT: Error processing state, disconnecting.")
-                action = 'back_to_menu' # Signal to disconnect
-                error_processing = True
+                print(f"CLIENT ERROR processing server msg: {e}"); # import traceback; traceback.print_exc()
+                client_esc_pressed = True; error_processing = True # Force exit
 
-            # Handle Local Input (Send to Server) - Only if no error
-            if not error_processing:
+            if not error_processing: # Handle local input and update visuals
                 game_instance.handle_events(events_this_frame)
-                if not game_instance.running: # Check if ESC was pressed
-                    action = 'back_to_menu'
+                if not game_instance.running: client_esc_pressed = True # Client pressed ESC
 
-                # Update game volume based on client's setting
-                app_config['volume'] = game_instance.current_volume # Sync back from game slider
-                try:
-                     pygame.mixer.music.set_volume(app_config['volume'])
+                app_config['volume'] = game_instance.current_volume # Sync volume back
+                try: pygame.mixer.music.set_volume(app_config['volume'])
                 except pygame.error: pass
 
+                game_instance.dt = dt; game_instance.update() # Client-side updates
 
-            # Update Local Visuals/Animations - Only if no error
-            if not error_processing:
-                game_instance.dt = dt
-                game_instance.update() # Client update (animations, local player prediction if any)
-
-            # Check if client wants to leave or error occurred
-            if action == 'back_to_menu':
+            if client_esc_pressed: # Handle client leaving
                 current_state = STATE_MAIN_MENU
                 if client_instance: client_instance.disconnect(); client_instance = None
                 game_instance = None
 
-
+        # --- Playing Singleplayer ---
         elif current_state == STATE_PLAYING_SP:
             if not game_instance:
-                print("ERROR: SP state invalid. Returning to menu."); current_state = STATE_MAIN_MENU; continue
+                print("ERROR: SP state invalid."); current_state = STATE_MAIN_MENU; continue
 
-            game_instance.screen = screen # Update screen ref
+            game_instance.screen = screen
+            sp_esc_pressed = False
 
-            # Handle Input
-            game_instance.handle_events(events_this_frame)
-            if not game_instance.running: # Check if ESC pressed
-                action = 'back_to_menu'
+            game_instance.handle_events(events_this_frame) # Handle input
+            if not game_instance.running: sp_esc_pressed = True # Player pressed ESC
 
-            # Update Game State
-            game_instance.dt = dt;
-            game_instance.update()
+            game_instance.dt = dt; game_instance.update() # Update game simulation
 
-            # Update game volume based on player's setting
-            app_config['volume'] = game_instance.current_volume # Sync back from game slider
-            try:
-                 pygame.mixer.music.set_volume(app_config['volume'])
+            app_config['volume'] = game_instance.current_volume # Sync volume back
+            try: pygame.mixer.music.set_volume(app_config['volume'])
             except pygame.error: pass
 
-
-            # Check if player wants to leave
-            if action == 'back_to_menu':
+            if sp_esc_pressed: # Handle player leaving
+                save_game_state('sp')
                 current_state = STATE_MAIN_MENU; game_instance = None
 
-        # --- End State-Specific Logic ---
+        # --- End State Machine ---
 
-
-        # --- Draw based on State ---
+        # ------------------- #
+        # --- DRAWING --- #
+        # ------------------- #
         screen.fill(COLOR_DARK_GRAY) # Default background
+
         if current_state == STATE_MAIN_MENU:
             if main_menu: main_menu.draw()
+        elif current_state == STATE_PROMPT_NEW_LOAD:
+            # Prompt draws itself
+            prompt_title = "Singleplayer" if prompt_mode_target == 'sp' else "Host Game"
+            draw_text(screen, prompt_title, 48, screen.get_width()//2, screen.get_height()//3, COLOR_UI_HEADER, align="center")
+            mouse_pos_draw = pygame.mouse.get_pos()
+            for btn in prompt_buttons:
+                 color = COLOR_MENU_BUTTON_HOVER if btn['rect'].collidepoint(mouse_pos_draw) else COLOR_MENU_BUTTON
+                 pygame.draw.rect(screen, color, btn['rect'])
+                 pygame.draw.rect(screen, COLOR_BLACK, btn['rect'], 2)
+                 draw_text(screen, btn['text'], 30, btn['rect'].centerx, btn['rect'].centery, COLOR_WHITE, align="center")
         elif current_state == STATE_SETTINGS:
             if settings_menu: settings_menu.draw()
         elif current_state == STATE_SHOW_IP:
-             # Drawing handled within the state logic for this frame
-             pass
+             # Draw IP info while briefly in this state before HOSTING starts drawing game
+            current_w, current_h = screen.get_width(), screen.get_height()
+            draw_text(screen, f"Hosting on IP: {local_ip_address}", 36, current_w//2, current_h//2 - 40, COLOR_WHITE, align="center")
+            draw_text(screen, f"Port: {DEFAULT_PORT}", 36, current_w//2, current_h//2, COLOR_WHITE, align="center")
+            draw_text(screen, f"Update Interval: {current_network_interval:.3f}s", 24, current_w//2, current_h//2 + 40, COLOR_GRAY, align="center")
+            draw_text(screen, "Waiting for players... Press ESC to cancel", 24, current_w//2, current_h - 50, COLOR_GRAY, align="center")
         elif current_state in [STATE_HOSTING, STATE_PLAYING_MP_CLIENT, STATE_PLAYING_SP]:
-            if game_instance:
-                game_instance.draw()
-            else: # Should not happen if state transitions are correct
-                draw_text(screen, "Error: Game not loaded", 30, screen.get_width() // 2, screen.get_height() // 2, COLOR_RED, "center")
+            if game_instance: game_instance.draw()
+            else: draw_text(screen, "Error: Game not loaded", 30, screen.get_width()//2, screen.get_height()//2, COLOR_RED, "center")
         elif current_state == STATE_JOINING:
-            draw_text(screen, f"Connecting to {app_config.get('host_ip', '?')}...", 30, screen.get_width() // 2, screen.get_height() // 2, COLOR_WHITE, "center")
-        # --- End Drawing ---
+            draw_text(screen, f"Connecting to {app_config.get('host_ip', '?')}...", 30, screen.get_width()//2, screen.get_height()//2, COLOR_WHITE, "center")
 
-        pygame.display.flip() # Update the full display Surface to the screen
+        pygame.display.flip() # Update the screen
     # --- End Main Loop ---
 
 
-    # --- Cleanup ---
+    # =================== #
+    # --- CLEANUP --- #
+    # =================== #
     print("Exiting Application.")
-    # --- Save Configuration ---
+
+    # --- Save Game on Graceful Exit (if in SP/Host state) ---
+    if game_instance and current_state in [STATE_PLAYING_SP, STATE_HOSTING]:
+         save_game_state(game_instance.network_mode)
+    # --- End Save Game on Exit ---
+
+    # --- Save Application Configuration ---
     print(f"Attempting to save configuration to {CONFIG_FILENAME}...")
     try:
-        # Ensure app_config has the latest volume before saving
-        if game_instance: # If exiting from a game state, get latest volume
-            app_config['volume'] = game_instance.current_volume
-        elif 'volume' not in app_config: # If somehow volume key is missing, add default
-             app_config['volume'] = DEFAULT_MUSIC_VOLUME
+        # Ensure latest volume is in app_config
+        if game_instance: app_config['volume'] = game_instance.current_volume
+        elif 'volume' not in app_config: app_config['volume'] = DEFAULT_MUSIC_VOLUME
 
-        with open(CONFIG_FILENAME, 'w') as f:
-            json.dump(app_config, f, indent=4)
+        with open(CONFIG_FILENAME, 'w') as f: json.dump(app_config, f, indent=4)
         print("Configuration saved successfully.")
-    except IOError as e:
-        print(f"ERROR: Could not save configuration file: {e}")
-    # --- END Save Configuration ---
+    except IOError as e: print(f"ERROR: Could not save configuration file: {e}")
+    # --- End Save Config ---
 
-    # --- Stop Music ---
+    # --- Stop Music & Mixer ---
     try:
         pygame.mixer.music.stop()
-        pygame.mixer.quit() # Properly shut down mixer
+        pygame.mixer.quit()
     except pygame.error: pass
-    # -----------------------
+    # -------------------------
 
+    # --- Stop Network Instances ---
     if server_instance: server_instance.stop()
     if client_instance: client_instance.disconnect()
+    # --------------------------
 
     pygame.quit() # Uninitialize Pygame modules
     print("Application finished.")
     sys.exit()
 
 
-# --- Main execution ---
+# --- Main execution block ---
 if __name__ == '__main__':
-    print(f"Starting {GAME_TITLE} (v15.2 - Config Save & Volume)...")
+    # Print version and basic info
+    print(f"Starting {GAME_TITLE} (v15.3 - Save/Load & Music Fix)...")
     print(f"Networking: {MAX_PLAYERS} players max, Port {DEFAULT_PORT}")
     print(f"Default Resolution Index: {DEFAULT_RESOLUTION_INDEX}, Default Net Interval: {DEFAULT_NETWORK_UPDATE_INTERVAL:.3f}s")
     try:
-        main()
-    except Exception as e:
+        main() # Run the main application loop
+    except Exception as e: # Catch unexpected errors in main
         print("\n--- UNHANDLED TOP-LEVEL ERROR ---")
         import traceback
         traceback.print_exc()
         print("---------------------------------")
-        try:
-            pygame.quit() # Attempt to clean up pygame if possible
-        except Exception:
-            pass
+        try: pygame.quit() # Attempt cleanup
+        except Exception: pass
         sys.exit("Exited due to critical error.")
