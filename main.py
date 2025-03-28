@@ -104,6 +104,9 @@ COLOR_NETWORK_STATUS = COLOR_YELLOW
 COLOR_CHAT_BG = (*COLOR_DARK_GRAY, 180)
 COLOR_CHAT_TEXT = COLOR_WHITE
 COLOR_CHAT_INPUT_BG = (*COLOR_UI_BG, 220)
+COLOR_SLIDER_TRACK = COLOR_GRAY
+COLOR_SLIDER_HANDLE = COLOR_WHITE
+COLOR_SLIDER_HANDLE_DRAG = COLOR_YELLOW
 
 # Resource Types Enum
 RES_COPPER = 'copper'
@@ -1319,6 +1322,10 @@ class Game:
         self.prev_button_rect = None
         self.play_pause_button_rect = None
         self.next_button_rect = None
+        self.current_volume = DEFAULT_MUSIC_VOLUME  # Track volume (0.0 to 1.0)
+        self.volume_slider_track_rect = None
+        self.volume_slider_handle_rect = None
+        self.dragging_volume = False  # Is the user currently dragging the handle?
         self._setup_music_controls_ui()  # Calculate initial button positions
         if self.game_music_files:
             print(f"Found game music: {', '.join([os.path.basename(f) for f in self.game_music_files])}")
@@ -1326,7 +1333,7 @@ class Game:
             print("WARN: No game music files found matching pattern.")
         # Ensure volume is set (might be redundant if set in main)
         try:
-            pygame.mixer.music.set_volume(DEFAULT_MUSIC_VOLUME)
+            pygame.mixer.music.set_volume(self.current_volume)
         except pygame.error as e:
             print(f"WARN: Error setting game music volume: {e}")
 
@@ -1340,16 +1347,35 @@ class Game:
              print("CLIENT: Waiting for initial game state from server...")
 
     def _setup_music_controls_ui(self):
-        """Calculates the positions for music control buttons."""
+        """Calculates the positions for music control buttons and volume slider."""
         screen_w = self.screen.get_width()
         btn_size = 28
         margin = 10
-        y_pos = 10  # Position from the top
-        x_start = screen_w - margin - (btn_size * 3 + margin * 2)  # Start from right edge
+        slider_height = 8
+        slider_width = 80 # Width of the slider track
+        handle_height = 16
+        handle_width = 10
+        slider_bottom_margin = 8 # Space between slider and buttons
 
-        self.prev_button_rect = pygame.Rect(x_start, y_pos, btn_size, btn_size)
-        self.play_pause_button_rect = pygame.Rect(x_start + btn_size + margin, y_pos, btn_size, btn_size)
-        self.next_button_rect = pygame.Rect(x_start + (btn_size + margin) * 2, y_pos, btn_size, btn_size)
+        # --- Slider Positioning ---
+        slider_y = 10 # Position from the top
+        slider_x = screen_w - margin - slider_width # Align right edge with button area start
+
+        self.volume_slider_track_rect = pygame.Rect(slider_x, slider_y, slider_width, slider_height)
+
+        # Initial handle position based on current_volume
+        handle_center_x = slider_x + int(self.current_volume * slider_width)
+        handle_y = slider_y + (slider_height / 2) - (handle_height / 2) # Center handle vertically on track
+        self.volume_slider_handle_rect = pygame.Rect(0, handle_y, handle_width, handle_height)
+        self.volume_slider_handle_rect.centerx = handle_center_x # Set center x after creating rect
+
+        # --- Button Positioning (relative to slider) ---
+        buttons_y = slider_y + slider_height + slider_bottom_margin
+        buttons_x_start = screen_w - margin - (btn_size * 3 + margin * 2) # Recalculate for clarity
+
+        self.prev_button_rect = pygame.Rect(buttons_x_start, buttons_y, btn_size, btn_size)
+        self.play_pause_button_rect = pygame.Rect(buttons_x_start + btn_size + margin, buttons_y, btn_size, btn_size)
+        self.next_button_rect = pygame.Rect(buttons_x_start + (btn_size + margin) * 2, buttons_y, btn_size, btn_size)
 
     def load_and_play_song(self, index):
         """Loads and plays a song by index from the game music list."""
@@ -1787,92 +1813,201 @@ class Game:
     # --- Input Handling ---
     # (handle_events remains the same)
     def handle_events(self, events):
+        """Handles player input, UI interaction, and music controls."""
         local_player = self.players.get(self.local_player_id)
-        # if local_player is None and self.network_mode != "sp" and self.local_player_id is not None:
-             # print(f"WARN: Local player object missing for ID {self.local_player_id}")
 
+        # --- Update Local Player Movement Intent (Sent Separately if Client) ---
         keys = pygame.key.get_pressed()
         my, mx = (keys[pygame.K_s] - keys[pygame.K_w]), (keys[pygame.K_d] - keys[pygame.K_a])
-        payload = None; direction_changed = False
+        payload = None
+        direction_changed = False
         if local_player:
             if local_player.move_x != mx or local_player.move_y != my:
-                direction_changed = True; local_player.move_x, local_player.move_y = mx, my
+                direction_changed = True
+                local_player.move_x, local_player.move_y = mx, my
                 payload = {'action': 'move', 'data': {'x': mx, 'y': my}}
         if self.network_mode == "client" and self.client and payload and direction_changed:
             self.client.send_message({'type': 'input', 'payload': payload})
+        # --- End Movement ---
 
-        mouse_pos = pygame.mouse.get_pos(); mouse_over_ui = mouse_pos[1] >= self.map_height_px
+        mouse_pos = pygame.mouse.get_pos()
+        mouse_over_ui = mouse_pos[1] >= self.map_height_px
         mouse_gx, mouse_gy = world_to_grid(*mouse_pos)
+
+        # --- Tooltip Hover Update ---
         new_hover_id = None
         if not mouse_over_ui:
             struct = self.get_structure_at(mouse_gx, mouse_gy)
-            if struct and struct.is_power_node: new_hover_id = struct.network_id
+            if struct and struct.is_power_node:
+                new_hover_id = struct.network_id
         if new_hover_id != self.hovered_power_node_id:
-            self.hovered_power_node_id = new_hover_id; self.network_stats = None; self.network_stats_timer = 0
+            self.hovered_power_node_id = new_hover_id
+            self.network_stats = None
+            self.network_stats_timer = 0
+        # --- End Tooltip ---
 
+        # --- Process Event Queue ---
         for event in events:
-            if event.type == pygame.QUIT: self.running = False; continue
-            if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE: self.running = False; continue
-                if self.game_over or self.game_won: continue
-                key = event.key; payload = None
-                if key == pygame.K_0: self.selected_building_type = BUILDING_NONE
+            # --- Per-Event Flags to check if UI handled this event ---
+            slider_interacted = False
+            button_interacted = False
+            # -------------------------------------------------------
+
+            if event.type == pygame.QUIT:
+                self.running = False
+                continue # Go to next event or exit loop
+
+            # --- Handle Mouse Button Down ---
+            if event.type == pygame.MOUSEBUTTONDOWN:
+                # --- Volume Slider Drag Start / Track Click ---
+                if event.button == 1:
+                    if self.volume_slider_handle_rect and self.volume_slider_handle_rect.collidepoint(mouse_pos):
+                        self.dragging_volume = True
+                        slider_interacted = True
+                    elif self.volume_slider_track_rect and self.volume_slider_track_rect.collidepoint(mouse_pos):
+                        # Clicked on track -> set volume directly
+                        relative_x = mouse_pos[0] - self.volume_slider_track_rect.left
+                        self.current_volume = max(0.0, min(1.0, relative_x / self.volume_slider_track_rect.width))
+                        try:
+                            pygame.mixer.music.set_volume(self.current_volume)
+                        except pygame.error as e: print(f"WARN: Set volume error: {e}")
+                        # Update handle position immediately
+                        self.volume_slider_handle_rect.centerx = self.volume_slider_track_rect.left + int(self.current_volume * self.volume_slider_track_rect.width)
+                        slider_interacted = True
+                # --------------------------------------------
+
+                # --- Music Buttons Click ---
+                if event.button == 1 and not slider_interacted and self.game_music_files:
+                     if self.prev_button_rect and self.prev_button_rect.collidepoint(mouse_pos):
+                         self.play_prev_song()
+                         button_interacted = True
+                     elif self.play_pause_button_rect and self.play_pause_button_rect.collidepoint(mouse_pos):
+                         self.toggle_pause()
+                         button_interacted = True
+                     elif self.next_button_rect and self.next_button_rect.collidepoint(mouse_pos):
+                         self.play_next_song()
+                         button_interacted = True
+                # -------------------------
+
+                # --- Game Action Click (Build/Delete) ---
+                # Only process if NO music UI was clicked during THIS mouse down event
+                if not slider_interacted and not button_interacted:
+                    if not self.game_over and not self.game_won and not mouse_over_ui:
+                        game_action_payload = None
+                        # Access event.button HERE, only when type is MOUSEBUTTONDOWN and UI wasn't clicked
+                        if event.button == 1 and self.selected_building_type != BUILDING_NONE:
+                            game_action_payload = {'action': 'place', 'data': {'type': self.selected_building_type, 'gx': mouse_gx, 'gy': mouse_gy, 'orient': self.selected_orientation}}
+                        elif event.button == 3: # Right Click for Delete
+                            game_action_payload = {'action': 'remove', 'data': {'gx': mouse_gx, 'gy': mouse_gy}}
+
+                        # Process the game action payload
+                        if game_action_payload:
+                            if self.network_mode == "client" and self.client:
+                                self.client.send_message({'type': 'input', 'payload': game_action_payload})
+                            elif self.network_mode != "client": # Server or SP
+                                action_type, data = game_action_payload['action'], game_action_payload['data']
+                                if action_type == 'place':
+                                    self.action_place_structure(self.local_player_id, data['type'], data['gx'], data['gy'], data['orient'])
+                                elif action_type == 'remove':
+                                    self.action_remove_structure(self.local_player_id, data['gx'], data['gy'])
+                # ---------------------------------------
+
+            # --- Handle Mouse Button Up ---
+            elif event.type == pygame.MOUSEBUTTONUP:
+                if event.button == 1 and self.dragging_volume:
+                    self.dragging_volume = False
+                    slider_interacted = True # Treat mouse up after drag as UI interaction for this event cycle
+            # ---------------------------
+
+            # --- Handle Mouse Motion ---
+            elif event.type == pygame.MOUSEMOTION:
+                if self.dragging_volume:
+                    # Update volume and handle position based on drag
+                    clamped_x = max(self.volume_slider_track_rect.left, min(mouse_pos[0], self.volume_slider_track_rect.right))
+                    relative_x = clamped_x - self.volume_slider_track_rect.left
+                    self.current_volume = relative_x / self.volume_slider_track_rect.width
+                    try:
+                         pygame.mixer.music.set_volume(self.current_volume)
+                    except pygame.error as e: print(f"WARN: Set volume error: {e}")
+                    self.volume_slider_handle_rect.centerx = clamped_x
+                    slider_interacted = True # Treat dragging motion as UI interaction
+            # --------------------------
+
+            # --- Handle Key Down ---
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    self.running = False # Signal to main loop to exit game state
+                    continue # Skip other key handling for this frame
+
+                if self.game_over or self.game_won:
+                    continue # Ignore game keys if game ended
+
+                key = event.key
+                key_action_payload = None
+
+                # Building Selection / Deselection / Rotation
+                if key == pygame.K_0:
+                    self.selected_building_type = BUILDING_NONE
                 elif key == pygame.K_r and self.selected_building_type == BUILDING_CONVEYOR:
                     self.selected_orientation = (self.selected_orientation + 1) % 4
+                    # Update preview instance if it exists
                     preview = self.preview_instances.get(BUILDING_CONVEYOR)
                     if preview: preview.orientation = self.selected_orientation
-                elif key == pygame.K_u and self.selected_building_type == BUILDING_NONE and not mouse_over_ui:
-                    payload = {'action': 'upgrade', 'data': {'gx': mouse_gx, 'gy': mouse_gy}}
                 elif key in self.key_to_building_type:
                     selected = self.key_to_building_type[key]
                     if self.selected_building_type != selected:
-                        self.selected_building_type = selected; self.selected_orientation = EAST
-                if payload:
-                    if self.network_mode == "client" and self.client: self.client.send_message({'type': 'input', 'payload': payload})
-                    elif self.network_mode != "client":
-                        if payload['action'] == 'upgrade': self.action_upgrade_structure(self.local_player_id, **payload['data'])
-            elif event.type == pygame.MOUSEBUTTONDOWN:
-                music_handled = False
-                if self.game_music_files:  # Only handle if music exists
-                    if self.prev_button_rect and self.prev_button_rect.collidepoint(mouse_pos):
-                        self.play_prev_song()
-                        music_handled = True
-                    elif self.play_pause_button_rect and self.play_pause_button_rect.collidepoint(mouse_pos):
-                        self.toggle_pause()
-                        music_handled = True
-                    elif self.next_button_rect and self.next_button_rect.collidepoint(mouse_pos):
-                        self.play_next_song()
-                        music_handled = True
+                        self.selected_building_type = selected
+                        self.selected_orientation = EAST # Reset orientation for non-conveyors
 
-                if music_handled:
-                    continue
+                # Upgrade Action
+                elif key == pygame.K_u and self.selected_building_type == BUILDING_NONE and not mouse_over_ui:
+                    # Check if mouse is over a valid building for upgrade
+                    struct_to_upgrade = self.get_structure_at(mouse_gx, mouse_gy)
+                    if struct_to_upgrade and struct_to_upgrade.building_type != BUILDING_RESOURCE:
+                         key_action_payload = {'action': 'upgrade', 'data': {'gx': mouse_gx, 'gy': mouse_gy}}
 
-                if self.game_over or self.game_won or mouse_over_ui: continue
-                payload = None
-                if event.button == 1 and self.selected_building_type != BUILDING_NONE:
-                    payload = {'action': 'place', 'data': {'type': self.selected_building_type, 'gx': mouse_gx, 'gy': mouse_gy, 'orient': self.selected_orientation}}
-                elif event.button == 3:
-                     payload = {'action': 'remove', 'data': {'gx': mouse_gx, 'gy': mouse_gy}}
-                if payload:
-                    if self.network_mode == "client" and self.client: self.client.send_message({'type': 'input', 'payload': payload})
-                    elif self.network_mode != "client":
-                        action, data = payload['action'], payload['data']
-                        if action == 'place': self.action_place_structure(self.local_player_id, data['type'], data['gx'], data['gy'], data['orient'])
-                        elif action == 'remove': self.action_remove_structure(self.local_player_id, data['gx'], data['gy'])
+                # Send key-based game actions
+                if key_action_payload:
+                    if self.network_mode == "client" and self.client:
+                        self.client.send_message({'type': 'input', 'payload': key_action_payload})
+                    elif self.network_mode != "client": # Server or SP
+                         if key_action_payload['action'] == 'upgrade':
+                             self.action_upgrade_structure(self.local_player_id, **key_action_payload['data'])
 
     def draw_music_controls(self):
-        """Draws the music control buttons in the top-right corner."""
-        if not self.game_music_files: return  # Don't draw if no music
+        """Draws the music control buttons and volume slider."""
+        if not self.game_music_files: return # Don't draw if no music
 
         mouse_pos = pygame.mouse.get_pos()
-        btn_color = (*COLOR_UI_BG[:3], 180)  # Semi-transparent background
+        btn_color = (*COLOR_UI_BG[:3], 180)
         hover_color = (*COLOR_MENU_BUTTON_HOVER[:3], 220)
         border_color = COLOR_GRAY
         text_color = COLOR_WHITE
 
+        # --- Draw Slider ---
+        if self.volume_slider_track_rect and self.volume_slider_handle_rect:
+            # Draw Track
+            pygame.draw.rect(self.screen, COLOR_SLIDER_TRACK, self.volume_slider_track_rect, border_radius=4)
+            # Draw Handle
+            handle_color = COLOR_SLIDER_HANDLE_DRAG if self.dragging_volume else COLOR_SLIDER_HANDLE
+            pygame.draw.rect(self.screen, handle_color, self.volume_slider_handle_rect, border_radius=3)
+            pygame.draw.rect(self.screen, border_color, self.volume_slider_handle_rect, 1, border_radius=3) # Border
+
+            # Optional: Draw volume percentage text
+            if font_tiny:
+                 vol_percent = int(self.current_volume * 100)
+                 # --- FIX: Define or replace margin ---
+                 text_margin = 5 # Use a small fixed margin value
+                 text_x = self.volume_slider_track_rect.right + text_margin
+                 # -------------------------------------
+                 text_y = self.volume_slider_track_rect.centery
+                 draw_text(self.screen, f"{vol_percent}%", 14, text_x, text_y, COLOR_GRAY, align="midleft")
+        # ------------------
+
+        # --- Draw Buttons ---
         buttons = [
             (self.prev_button_rect, "<<"),
-            (self.play_pause_button_rect, "||" if self.music_playing else ">"),  # Dynamic label
+            (self.play_pause_button_rect, "||" if self.music_playing else ">"),
             (self.next_button_rect, ">>")
         ]
 
@@ -1882,16 +2017,18 @@ class Game:
                 pygame.draw.rect(self.screen, current_color, rect)
                 pygame.draw.rect(self.screen, border_color, rect, 1)
                 draw_text(self.screen, text, 20, rect.centerx, rect.centery, text_color, align="center")
+        # -------------------
 
-        # Optionally draw current song name
+        # --- Draw Song Name ---
         if font_tiny and self.current_song_index != -1:
-            try:
-                song_name = os.path.basename(self.game_music_files[self.current_song_index])
-                name_x = self.prev_button_rect.left
-                name_y = self.prev_button_rect.bottom + 5
-                draw_text(self.screen, song_name, 14, name_x, name_y, COLOR_GRAY, align="topleft")
-            except IndexError:
-                pass  # Index might be invalid briefly during transitions
+             try:
+                 song_name = os.path.basename(self.game_music_files[self.current_song_index])
+                 name_x = self.prev_button_rect.left
+                 name_y = self.prev_button_rect.bottom + 5
+                 draw_text(self.screen, song_name, 14, name_x, name_y, COLOR_GRAY, align="topleft")
+             except IndexError:
+                 pass
+        # --------------------
 
     # --- Update Logic ---
     # (update method remains the same, ensuring player/enemy boundary checks use self.map_width/height_px)
