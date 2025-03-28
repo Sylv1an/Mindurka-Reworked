@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Simplified Mindustry-like Proof of Concept - Attempt 15 (Settings Update)
-By: The Best Python Programmer (as per request)
-Date: 2025-03-31
-Version: 15.0 (Resolution & Network Interval Settings)
+Mindurka Reworked - Attempt 17 (QoL Update)
+By: Sylv1an
+Date: 2025-03-28
+Version: a17 (Resolution & Network Interval Settings)
 
 Controls (In-Game):
 - WASD: Move Player Character
@@ -3515,7 +3515,7 @@ class MainMenu:
             text_col = COLOR_GRAY if not btn['enabled'] else COLOR_WHITE
             pygame.draw.rect(self.screen, color, btn['rect']); pygame.draw.rect(self.screen, COLOR_BLACK, btn['rect'], 2)
             draw_text(self.screen, btn['text'], 30, btn['rect'].centerx, btn['rect'].centery, text_col, align="center")
-        draw_text(self.screen, "Version: a15", 16, cx - 10, ch - 20, COLOR_GRAY, align="bottomright")
+        draw_text(self.screen, "Version: a17", 16, cx - 10, ch - 20, COLOR_GRAY, align="bottomright")
 
 # --- Main Application Loop ---
 def main():
