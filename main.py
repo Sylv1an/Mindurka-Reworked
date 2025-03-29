@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Mindurka Reworked - Attempt 17 (QoL Update)
+Mindurka Reworked - Attempt 18 (Particles)
 By: Sylv1an
 Date: 2025-03-28
-Version: a17 (Resolution & Network Interval Settings)
+Version: a18 (Particles)
 
 Controls (In-Game):
 - WASD: Move Player Character
@@ -111,6 +111,17 @@ COLOR_CHAT_INPUT_BG = (*COLOR_UI_BG, 220)
 COLOR_SLIDER_TRACK = COLOR_GRAY
 COLOR_SLIDER_HANDLE = COLOR_WHITE
 COLOR_SLIDER_HANDLE_DRAG = COLOR_YELLOW
+
+# --- Particle Constants ---
+PARTICLE_COUNT = 4000
+PARTICLE_COLORS = [(35, 30, 60), (60, 60, 75), (70, 70, 90), (40, 40, 50)] # Subtle dark blues/grays
+PARTICLE_SPEED_RANGE = (-20, 20) # Pixels per second (slow drift)
+PARTICLE_SIZE_RANGE = (1, 3)    # Radius
+PARTICLE_LIFETIME_RANGE = (8.0, 20.0) # Seconds
+PARTICLE_DAMPING = 0.97
+CURSOR_INFLUENCE_RADIUS = 80    # Pixels: How close the cursor needs to be
+CURSOR_INFLUENCE_RADIUS_SQ = CURSOR_INFLUENCE_RADIUS * CURSOR_INFLUENCE_RADIUS # For efficiency
+CURSOR_REPULSION_STRENGTH = 2500 # Acceleration strength (pixels/sec^2) # <-- ADDED (Adjust as needed)
 
 # Resource Types Enum
 RES_COPPER = 'copper'
@@ -342,6 +353,104 @@ def get_local_ip():
         if s:
             s.close()
     return ip
+
+# --- Particle Functions ---
+def init_particles(screen_width, screen_height, count):
+    """Creates a list of particles with random properties."""
+    particles = []
+    for _ in range(count):
+        x = random.uniform(0, screen_width)
+        y = random.uniform(0, screen_height)
+        vx = random.uniform(*PARTICLE_SPEED_RANGE)
+        vy = random.uniform(*PARTICLE_SPEED_RANGE)
+        size = random.randint(*PARTICLE_SIZE_RANGE)
+        color = random.choice(PARTICLE_COLORS)
+        max_lifetime = random.uniform(*PARTICLE_LIFETIME_RANGE)
+        lifetime = random.uniform(0, max_lifetime) # Start with random age for variety
+        # Store as [x, y, vx, vy, size, color, lifetime, max_lifetime]
+        particles.append([x, y, vx, vy, size, color, lifetime, max_lifetime])
+    print(f"Initialized {len(particles)} background particles.")
+    return particles
+
+def update_particles(particles, dt, screen_width, screen_height):
+    """Updates particle positions, lifetimes, applies damping, and handles cursor repulsion."""
+    try:
+        mouse_x, mouse_y = pygame.mouse.get_pos()
+    except pygame.error: # Handle case where mouse isn't focused (e.g., during startup)
+        mouse_x, mouse_y = -1000, -1000 # Place cursor far away if error
+
+    for p in particles:
+        # Store original velocity before applying forces
+        orig_vx, orig_vy = p[2], p[3]
+
+        # --- Cursor Repulsion ---
+        dx = p[0] - mouse_x
+        dy = p[1] - mouse_y
+        dist_sq = dx*dx + dy*dy
+
+        if dist_sq < CURSOR_INFLUENCE_RADIUS_SQ and dist_sq > 1e-4: # Check if within radius and not exactly on cursor
+            dist = math.sqrt(dist_sq)
+            # Normalized direction vector FROM cursor TO particle
+            norm_dx = dx / dist
+            norm_dy = dy / dist
+
+            # Calculate force magnitude with linear falloff (stronger closer)
+            # The force is stronger when dist is small, weaker as dist approaches radius
+            falloff_factor = (1.0 - (dist / CURSOR_INFLUENCE_RADIUS))
+            force_magnitude = CURSOR_REPULSION_STRENGTH * falloff_factor
+
+            # Apply force as acceleration (modifies velocity)
+            # Acceleration = Force_Direction * Force_Magnitude
+            # Change in velocity = Acceleration * dt
+            p[2] += norm_dx * force_magnitude * dt
+            p[3] += norm_dy * force_magnitude * dt
+        # --- End Cursor Repulsion ---
+
+        # --- Apply Damping ---
+        p[2] *= PARTICLE_DAMPING
+        p[3] *= PARTICLE_DAMPING
+        # --- End Damping ---
+
+        # --- Update position based on potentially modified velocity ---
+        p[0] += p[2] * dt
+        p[1] += p[3] * dt
+        # --- End Position Update ---
+
+        # --- Update lifetime ---
+        p[6] -= dt
+        # --- End Lifetime ---
+
+        # --- Reset particle if needed ---
+        margin = p[4] * 2 # Margin based on size
+        # Check bounds slightly wider than the screen to allow smooth re-entry
+        needs_reset = (p[6] <= 0 or
+                       p[0] < -margin * 5 or p[0] > screen_width + margin * 5 or
+                       p[1] < -margin * 5 or p[1] > screen_height + margin * 5)
+
+        if needs_reset:
+            # Respawn at a random position
+            p[0] = random.uniform(0, screen_width)
+            p[1] = random.uniform(0, screen_height)
+            # Reset to initial drift speed, not the potentially high speed from repulsion
+            p[2] = random.uniform(*PARTICLE_SPEED_RANGE) # New vx
+            p[3] = random.uniform(*PARTICLE_SPEED_RANGE) # New vy
+            p[4] = random.randint(*PARTICLE_SIZE_RANGE)        # New size
+            p[5] = random.choice(PARTICLE_COLORS)              # New color
+            p[7] = random.uniform(*PARTICLE_LIFETIME_RANGE)    # New max_lifetime
+            p[6] = p[7] # Reset lifetime
+        # --- End Reset ---
+
+def draw_particles(surface, particles):
+    """Draws the particles onto the given surface."""
+    for p in particles:
+        try:
+            # Use integer positions for drawing
+            pos = (int(p[0]), int(p[1]))
+            pygame.draw.circle(surface, p[5], pos, p[4])
+        except Exception as e:
+            # Safety catch for rare errors during drawing
+            # print(f"Debug: Error drawing particle: {e} - Data: {p}")
+            pass # Skip drawing this particle if something goes wrong
 
 # --- Player Class ---
 class Player:
@@ -1179,7 +1288,7 @@ class SettingsMenu:
         else: self.show_cursor = False
 
     def draw(self):
-        self.screen.fill(COLOR_SETTINGS_BG)
+        # REMOVED: self.screen.fill(COLOR_SETTINGS_BG) # Main loop handles background fill now
         center_x = self.screen_width // 2; label_offset_y = -30
         draw_text(self.screen, self.title, 70, center_x, 60, COLOR_MENU_TITLE, align="center")
         # Name
@@ -3484,7 +3593,6 @@ class Client:
 
 
 # --- Main Menu Class ---
-# (MainMenu class remains the same as previous version)
 class MainMenu:
     def __init__(self, screen, clock):
         self.screen = screen; self.clock = clock; self.buttons = []; self.title = "Mindurka Reworked"
@@ -3505,7 +3613,7 @@ class MainMenu:
         elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE: self.selected_action = "quit"
     def get_action(self): action = self.selected_action; self.selected_action = None; return action
     def draw(self):
-        self.screen.fill(COLOR_DARK_GRAY)
+        # REMOVED: self.screen.fill(COLOR_DARK_GRAY) # Main loop handles background fill now
         cx, ch = self.screen.get_width(), self.screen.get_height()
         draw_text(self.screen, self.title, 80, cx // 2, ch // 4, COLOR_MENU_TITLE, align="center")
         mouse_pos = pygame.mouse.get_pos()
@@ -3515,7 +3623,7 @@ class MainMenu:
             text_col = COLOR_GRAY if not btn['enabled'] else COLOR_WHITE
             pygame.draw.rect(self.screen, color, btn['rect']); pygame.draw.rect(self.screen, COLOR_BLACK, btn['rect'], 2)
             draw_text(self.screen, btn['text'], 30, btn['rect'].centerx, btn['rect'].centery, text_col, align="center")
-        draw_text(self.screen, "Version: a17", 16, cx - 10, ch - 20, COLOR_GRAY, align="bottomright")
+        draw_text(self.screen, "Version: a18", 16, cx - 10, ch - 20, COLOR_GRAY, align="bottomright") # Version updated in main loop logic if needed
 
 # --- Main Application Loop ---
 def main():
@@ -3605,6 +3713,15 @@ def main():
     if not font_medium: print("FATAL: Font load failed."); pygame.quit(); sys.exit()
     # -------------------------
 
+    # --- Initialize Background Particles ---
+    try: # Use current screen size after potential config load
+        current_w, current_h = screen.get_width(), screen.get_height()
+        background_particles = init_particles(current_w, current_h, PARTICLE_COUNT)
+    except Exception as e:
+        print(f"Error initializing particles: {e}. Using fallback size.")
+        background_particles = init_particles(800, 600, PARTICLE_COUNT) # Fallback
+    # -----------------------------------
+
     # --- State Definitions ---
     STATE_MAIN_MENU = 0
     STATE_PLAYING_SP = 1
@@ -3614,6 +3731,8 @@ def main():
     STATE_PLAYING_MP_CLIENT = 5
     STATE_SHOW_IP = 6
     STATE_PROMPT_NEW_LOAD = 7
+    # List of states where the actual game world is active (and particles should NOT be drawn)
+    GAMEPLAY_ACTIVE_STATES = [STATE_PLAYING_SP, STATE_HOSTING, STATE_PLAYING_MP_CLIENT]
     # -----------------------
 
     current_state = STATE_MAIN_MENU
@@ -3686,6 +3805,7 @@ def main():
             return None
     # --- End Save/Load Helpers ---
 
+
     # --- Play initial menu music ---
     if menu_music_loaded:
         try:
@@ -3711,6 +3831,11 @@ def main():
                     game_instance.handle_music_end_event()
         if not app_running: break
         # --- End Global Events ---
+
+        # --- Update Background Particles (if NOT in an active gameplay state) --- # MODIFIED #
+        if current_state not in GAMEPLAY_ACTIVE_STATES:
+            update_particles(background_particles, dt, screen.get_width(), screen.get_height())
+        # ---------------------------------------------------------------------- #
 
         # --- State Change Music & Volume Logic ---
         if current_state != previous_state:
@@ -3859,6 +3984,7 @@ def main():
                         screen = pygame.display.set_mode((new_w, new_h))
                         main_menu.screen = screen; settings_menu.screen = screen
                         if game_instance: game_instance.screen = screen
+                        background_particles = init_particles(new_w, new_h, PARTICLE_COUNT)
                     except Exception as e:
                         print(f"ERROR applying resolution: {e}")
                         app_config['resolution_index'] = DEFAULT_RESOLUTION_INDEX
@@ -3866,6 +3992,8 @@ def main():
                         screen = pygame.display.set_mode((def_w, def_h))
                         main_menu.screen = screen; settings_menu.screen = screen
                         if game_instance: game_instance.screen = screen
+                        def_w, def_h = AVAILABLE_RESOLUTIONS[DEFAULT_RESOLUTION_INDEX]
+                        background_particles = init_particles(def_w, def_h, PARTICLE_COUNT)
                 current_state = STATE_MAIN_MENU
 
         # --- Show IP ---
@@ -3985,10 +4113,16 @@ def main():
         # ------------------- #
         screen.fill(COLOR_DARK_GRAY) # Default background
 
+        # --- Draw Background Particles (if NOT in an active gameplay state) --- # MODIFIED #
+        if current_state not in GAMEPLAY_ACTIVE_STATES:
+            draw_particles(screen, background_particles)
+        # ---------------------------------------------------------------------- #
+
+        # --- Draw based on current state ---
         if current_state == STATE_MAIN_MENU:
             if main_menu: main_menu.draw()
         elif current_state == STATE_PROMPT_NEW_LOAD:
-            # Prompt draws itself
+            # Prompt draws itself (over particles if active)
             prompt_title = "Singleplayer" if prompt_mode_target == 'sp' else "Host Game"
             draw_text(screen, prompt_title, 48, screen.get_width()//2, screen.get_height()//3, COLOR_UI_HEADER, align="center")
             mouse_pos_draw = pygame.mouse.get_pos()
@@ -4000,16 +4134,20 @@ def main():
         elif current_state == STATE_SETTINGS:
             if settings_menu: settings_menu.draw()
         elif current_state == STATE_SHOW_IP:
-             # Draw IP info while briefly in this state before HOSTING starts drawing game
+             # Draw IP info (over particles if active)
             current_w, current_h = screen.get_width(), screen.get_height()
             draw_text(screen, f"Hosting on IP: {local_ip_address}", 36, current_w//2, current_h//2 - 40, COLOR_WHITE, align="center")
             draw_text(screen, f"Port: {DEFAULT_PORT}", 36, current_w//2, current_h//2, COLOR_WHITE, align="center")
             draw_text(screen, f"Update Interval: {current_network_interval:.3f}s", 24, current_w//2, current_h//2 + 40, COLOR_GRAY, align="center")
             draw_text(screen, "Waiting for players... Press ESC to cancel", 24, current_w//2, current_h - 50, COLOR_GRAY, align="center")
-        elif current_state in [STATE_HOSTING, STATE_PLAYING_MP_CLIENT, STATE_PLAYING_SP]:
-            if game_instance: game_instance.draw()
-            else: draw_text(screen, "Error: Game not loaded", 30, screen.get_width()//2, screen.get_height()//2, COLOR_RED, "center")
+        elif current_state in GAMEPLAY_ACTIVE_STATES: # Draw game only if in these states
+            if game_instance:
+                game_instance.draw() # Game draws its own background (grid, etc.)
+            else:
+                # Draw error over particles if active
+                draw_text(screen, "Error: Game not loaded", 30, screen.get_width()//2, screen.get_height()//2, COLOR_RED, "center")
         elif current_state == STATE_JOINING:
+            # Draw joining text (over particles if active)
             draw_text(screen, f"Connecting to {app_config.get('host_ip', '?')}...", 30, screen.get_width()//2, screen.get_height()//2, COLOR_WHITE, "center")
 
         pygame.display.flip() # Update the screen
@@ -4053,7 +4191,6 @@ def main():
     pygame.quit() # Uninitialize Pygame modules
     print("Application finished.")
     sys.exit()
-
 
 # --- Main execution block ---
 if __name__ == '__main__':
